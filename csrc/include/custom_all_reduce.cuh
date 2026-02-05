@@ -25,7 +25,6 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1746,13 +1745,6 @@ class CustomAllreduce
     // use new version of allreduce kernel
     if(use_new)
     {
-        hipDevice_t dev;
-        hipDeviceProp_t dev_prop;
-        hipGetDevice(&dev);
-        hipGetDeviceProperties(&dev_prop, dev);
-        std::string arch = dev_prop.gcnArchName;
-        bool use_write_mode = false;
-
         int blocks       = 16;
         bool call_1stage = false;
         bool call_2stage = false;
@@ -1778,12 +1770,9 @@ class CustomAllreduce
         }
         else if(call_2stage)
         {
-            blocks = std::min(kMaxBlocks,   
+            blocks = std::min(kMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
-            if (world_size_ == 8 && bytes > 512 * 4096 * 2 && arch.find("gfx942") != std::string::npos) {
-                use_write_mode = true;
-            }
         }
 
 #define KL(ngpus, name) \
@@ -1800,12 +1789,7 @@ class CustomAllreduce
     {                                                     \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
         {                                                 \
-            if (use_write_mode) {                         \
-                KL(ngpus, name##_write_mode);             \
-            }                                             \
-            else {                                        \
-                KL(ngpus, name);                          \
-            }                                             \
+            KL(ngpus, name);                          \
         }                                                 \
         else                                              \
         {                                                 \
