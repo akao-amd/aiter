@@ -865,8 +865,11 @@ def get_2stage_cfgs(
             ksplit
             if (run_1stage)
             else (
+                # per_1x128 CK 2-stage kernel expects a per-token a1_scale [m,1],
+                # but the quantizer produces per-block-K scale [m, K/128].
+                # splitk is therefore incompatible with per_1x128 in 2-stage mode.
                 get_ksplit(token, topk, expert, inter_dim, model_dim)
-                if q_type in [QuantType.per_1x128, QuantType.per_1x32]
+                if q_type == QuantType.per_1x32
                 else ksplit
             )
         )
