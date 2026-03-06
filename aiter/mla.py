@@ -186,6 +186,7 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
+    io_head_padded = False  # True when heads were zero-padded to 16 (sub-16 head case)
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -321,6 +322,38 @@ def mla_decode_fwd(
 
             o = o.view(total_s, nhead, -1)
             io_transformed = True
+        elif ori_nhead < 16 and 16 % ori_nhead == 0 and persistent_mode:
+            # Handle sub-16 head counts (e.g. nhead=8, 4, 2, 1) that arise when
+            # using high tensor-parallelism degrees with models like Kimi-K2-Instruct-0905
+            # (64 heads total, TP=8 → 8 heads/GPU, TP=16 → 4 heads/GPU, etc.).
+            #
+            # Strategy: pad the head dimension up to 16 by creating a padded q/o buffer.
+            # The real heads are placed at positions [0:ori_nhead] within each 16-head tile.
+            # The ASM kernel processes the full 16-head tile; padded heads produce zeros
+            # in the output which are then discarded.
+            padded_nhead = 16
+            total_s = ori_total_s
+
+            qk_head_dim = q.shape[-1]
+            q_padded = torch.zeros(
+                (total_s, padded_nhead, qk_head_dim),
+                dtype=q.dtype,
+                device=device,
+            )
+            q_padded[:, :ori_nhead, :] = q
+            q = q_padded
+
+            o_padded = torch.zeros(
+                (total_s, padded_nhead, v_head_dim),
+                dtype=o.dtype,
+                device=device,
+            )
+            o_padded[:, :ori_nhead, :] = o
+            o_orig = o
+            o = o_padded
+            nhead = padded_nhead
+            io_transformed = True
+            io_head_padded = True
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
@@ -374,28 +407,36 @@ def mla_decode_fwd(
         )
 
     if io_transformed:
-        if return_logits:
-            logits = logits.view(-1, 1, ori_nhead, v_head_dim)
-
-        if max_seqlen_q == 1:
-            q = q.view(ori_total_s, ori_nhead, -1)
-            o = o.view(ori_total_s, ori_nhead, -1)
-        else:
-            # for test, q need to be transpose into the original shape
-            new_o = (
-                o.reshape(
-                    ori_total_s // max_seqlen_q,
-                    ori_nhead // nhead,
-                    max_seqlen_q,
-                    nhead,
-                    -1,
-                )
-                .permute(0, 2, 1, 3, 4)
-                .reshape(ori_total_s, ori_nhead, -1)
-                .contiguous()
-            )
-            o_orig.set_(new_o)
+        if io_head_padded:
+            # Sub-16 head case: copy the valid head slice from the padded buffer back.
+            # o is [ori_total_s, 16, v_head_dim], ori_nhead < 16.
+            o_orig.copy_(o[:, :ori_nhead, :])
             o = o_orig
+            if return_logits:
+                logits = logits[:, :, :ori_nhead, :]
+        else:
+            if return_logits:
+                logits = logits.view(-1, 1, ori_nhead, v_head_dim)
+
+            if max_seqlen_q == 1:
+                q = q.view(ori_total_s, ori_nhead, -1)
+                o = o.view(ori_total_s, ori_nhead, -1)
+            else:
+                # for test, q need to be transpose into the original shape
+                new_o = (
+                    o.reshape(
+                        ori_total_s // max_seqlen_q,
+                        ori_nhead // nhead,
+                        max_seqlen_q,
+                        nhead,
+                        -1,
+                    )
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(ori_total_s, ori_nhead, -1)
+                    .contiguous()
+                )
+                o_orig.set_(new_o)
+                o = o_orig
 
     return logits, final_lse
 

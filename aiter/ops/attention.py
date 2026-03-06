@@ -809,16 +809,25 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 16 == 0
+    # num_head_qo must be divisible by 16 OR must be a divisor of 16 (e.g. 8, 4, 2, 1).
+    # When num_head_qo < 16 and 16 % num_head_qo == 0, the kernel simulates the heads
+    # by padding them up to 16 (one full tile), so metadata is sized as if nhead=16.
+    assert num_head_qo % 16 == 0 or (
+        num_head_qo < 16 and 16 % num_head_qo == 0
+    ), f"num_head_qo={num_head_qo} must be divisible by 16 or a power-of-2 divisor of 16"
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
+    # For sub-16 head counts (e.g. 8, 4, 2), we size metadata as if nhead=16 since
+    # the ASM kernel processes a minimum tile of 16 heads (heads are padded to fill tile).
+    effective_num_head = max(num_head_qo, 16) if num_head_qo < 16 else num_head_qo
+
     max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16
-        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
-        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+        int(math.ceil(max_seqlen_qo * effective_num_head / 128))
+        if effective_num_head == 16
+        or (effective_num_head == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
+        else int(math.ceil(max_seqlen_qo * effective_num_head / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
