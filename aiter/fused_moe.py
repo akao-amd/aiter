@@ -1137,6 +1137,12 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+        # CK per_1x128 splitk kernel expects a1_scale in [K_blocks, token] layout.
+        # fused_moe_1stage handles this via partial_transpose; mirror that here.
+        if quant_type == QuantType.per_1x128 and metadata.ksplit > 1:
+            scale_t = torch.empty_like(a1_scale)
+            aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+            a1_scale = scale_t
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
