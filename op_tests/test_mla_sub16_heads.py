@@ -403,8 +403,7 @@ def test_output_fully_written(nhead):
     )
 
     # Fill with a recognisable sentinel
-    sentinel = torch.bfloat16(-1.0)
-    out_asm = torch.full((total_q, nhead, v_head_dim), float(sentinel), dtype=torch.bfloat16)
+    out_asm = torch.full((total_q, nhead, v_head_dim), -1.0, dtype=torch.bfloat16)
 
     aiter.mla.mla_decode_fwd(
         q,
@@ -429,7 +428,7 @@ def test_output_fully_written(nhead):
 
     # After kernel runs, none of the entries should still be exactly -1
     # (attention outputs are weighted averages, so -1 is astronomically unlikely)
-    unchanged = (out_asm == sentinel).sum().item()
+    unchanged = (out_asm == -1.0).sum().item()
     assert unchanged == 0, (
         f"nhead={nhead}: {unchanged} output elements still have sentinel value -1; "
         "kernel may not have written all outputs."
