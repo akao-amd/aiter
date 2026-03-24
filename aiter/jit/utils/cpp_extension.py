@@ -88,10 +88,45 @@ def executable_path(executable: str) -> str:
 def get_hip_version():
     try:
         hipconfig = executable_path("hipconfig")
-        output = subprocess.check_output([hipconfig, "--version"], text=True)
-        return output
-    except Exception:
-        raise RuntimeError("ROCm version file not found")
+        # Try to get version - hipconfig may fail but still output to stderr
+        try:
+            output = subprocess.check_output(
+                [hipconfig, "--version"],
+                text=True,
+                stderr=subprocess.STDOUT
+            )
+            return output.strip()
+        except subprocess.CalledProcessError as e:
+            # hipconfig may return non-zero but still output version to stderr
+            # Try stderr redirection
+            result = subprocess.run(
+                [hipconfig, "--version"],
+                capture_output=True,
+                text=True
+            )
+            # Check both stdout and stderr
+            output = result.stdout or result.stderr
+            if output and output.strip():
+                # hipconfig outputs version even on error
+                return output.strip()
+            raise
+    except Exception as e:
+        # If hipconfig doesn't exist or fails completely, just skip ROCm detection
+        # This is not a fatal error - the system may not have ROCm installed
+        if os.environ.get("DEBUG_ROCM") == "1":
+            print(f"[DEBUG] Failed to get ROCm version: {e}", file=sys.stderr)
+            print(f"[DEBUG] ROCM_HOME env var: {os.environ.get('ROCM_HOME')}", file=sys.stderr)
+            print(f"[DEBUG] ROCM_PATH env var: {os.environ.get('ROCM_PATH')}", file=sys.stderr)
+            print(f"[DEBUG] hipcc in PATH: {shutil.which('hipcc')}", file=sys.stderr)
+            print(f"[DEBUG] hipconfig in PATH: {shutil.which('hipconfig')}", file=sys.stderr)
+            rocm_home = _find_rocm_home()
+            print(f"[DEBUG] Detected ROCM_HOME: {rocm_home}", file=sys.stderr)
+            if rocm_home:
+                hipconfig_path = os.path.join(rocm_home, "bin", "hipconfig")
+                print(f"[DEBUG] Looking for hipconfig at: {hipconfig_path}", file=sys.stderr)
+                print(f"[DEBUG] hipconfig exists: {os.path.exists(hipconfig_path)}", file=sys.stderr)
+        # Return None instead of raising - ROCm may not be installed
+        return None
 
 
 def _find_rocm_home() -> Optional[str]:
@@ -178,7 +213,14 @@ IS_HIP_EXTENSION = (
 )
 ROCM_VERSION = None
 if HIP_VERSION is not None:
-    ROCM_VERSION = tuple(int(v) for v in HIP_VERSION.split(".")[:2])
+    try:
+        # Parse version string, handling various formats
+        version_parts = HIP_VERSION.split(".")
+        ROCM_VERSION = tuple(int(v) for v in version_parts[:2])
+    except (ValueError, IndexError):
+        if os.environ.get("DEBUG_ROCM") == "1":
+            print(f"[DEBUG] Failed to parse HIP_VERSION: {HIP_VERSION}", file=sys.stderr)
+        ROCM_VERSION = None
 
 # PyTorch releases have the version pattern major.minor.patch, whereas when
 # PyTorch is built from source, we append the git commit hash, which gives
