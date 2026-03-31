@@ -422,7 +422,6 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& pa
     }
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
@@ -490,7 +489,6 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& pa
                                                  p_lds_lse_scale,
                                                  p_final_lse_base);
 
-        __builtin_amdgcn_sched_barrier(0);
         ck_tile::block_sync_lds();
 
         reduce_output_massive<Traits>(params,
@@ -526,7 +524,6 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& par
     }
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
