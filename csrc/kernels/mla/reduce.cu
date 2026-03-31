@@ -920,8 +920,10 @@ int32_t get_num_work_group_per_bh(const int32_t num_reduce_tile,
     using DummyTraits         = MlaReduceKernelV1Traits<128, 1, 1>;
     const int32_t hw_capacity = num_cu * DummyTraits::kOccupancy;
 
-    // the factor is empirical
-    constexpr float factor = 1.3f;
+    // the factor is empirical; 2.0 doubles the promotion window vs the original 1.3,
+    // ensuring kNumThreadGroupPerBh > 1 is selected whenever hw is less than half-
+    // utilised by the (head × tile) work alone.
+    constexpr float factor = 2.0f;
 
     if((hw_capacity * factor) > num_workloads)
     {
