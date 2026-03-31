@@ -3,11 +3,29 @@
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <cstdlib>
 #include <sstream>
 #include <torch/python.h>
 #include "aiter_hip_common.h"
+#include "aiter_logger.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
+
+// Trace logging controlled by AITER_LOG_MLA_REDUCE_V1 environment variable
+// Only logs during graph capture phase (not during replay)
+namespace {
+inline bool should_trace_mla_reduce_v1()
+{
+    static const bool enabled = (std::getenv("AITER_LOG_MLA_REDUCE_V1") != nullptr);
+    return enabled;
+}
+} // namespace
+
+#define MLA_REDUCE_V1_TRACE(msg)   do { \
+    if(should_trace_mla_reduce_v1()) { \
+        AITER_LOG_INFO("[mla_reduce_v1] " << msg); \
+    } \
+} while(0)
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>
 struct MlaReduceKernelV1Traits
@@ -983,6 +1001,13 @@ void mla_reduce_v1(
     const int32_t head_dim              = final_output.size(-1);
     const int32_t num_work_group_per_bh = get_num_work_group_per_bh(
         num_reduce_tile, max_seqlen_q, num_heads, dev_prop.multiProcessorCount);
+
+    // Log dimensions during graph capture (not during replay)
+    MLA_REDUCE_V1_TRACE("num_heads=" << num_heads
+                        << " head_dim=" << head_dim
+                        << " num_reduce_tile=" << num_reduce_tile
+                        << " max_seqlen_q=" << max_seqlen_q
+                        << " kNumThreadGroupPerBh=" << num_work_group_per_bh);
 
     if(num_reduce_tile > 0)
     {
