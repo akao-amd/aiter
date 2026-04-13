@@ -367,6 +367,17 @@ void mla_decode_stage1_asm_fwd(
         gdz = 1;
     }
 
+    printf("[akao] %s grid=(%d,%d,%d) block=(%d,1,1)"
+           " batch=%d num_heads=%d head_size=%d num_kv_heads=%d kv_split=%d"
+           " gqa_ratio=%d max_seqlen_q=%d page_size=%d"
+           " s_MQA=%u s_kv_split=%u s_Q_Bs=%u s_Bs=%u s_log2_plen=%u"
+           " scalar=%f out_16_nosplit=%u persistent=%d\n",
+           kernelName.c_str(), gdx, gdy, gdz, bdx,
+           batch, num_heads, head_size, num_kv_heads, kv_split,
+           gqa_ratio, max_seqlen_q, page_size,
+           args.s_MQA, args.s_kv_split, args.s_Q_Bs, args.s_Bs, args.s_log2_plen,
+           args.scalar, args.out_16_nosplit, (int)persistent);
+
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx,       // gdx
