@@ -895,30 +895,36 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
         {
             const dim3 grid =
                 dim3(Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh, params.num_reduce_tile);
-            printf("[akao] kn_mla_reduce_v1 grid=(%d,%d,%d) block=%d lds=%d"
-                   " kSizeDV=%d kNumHeadQ=%d kNumThreadGroupPerBh=%d"
-                   " stride_s_o=%d stride_h_o=%d max_splits=%d num_reduce_tile=%d"
-                   " output_lse=%d use_reduce_final_map=%d\n",
-                   grid.x, grid.y, grid.z, Traits::kNumThreads, lds_size,
-                   Traits::kSizeDV, Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh,
-                   params.stride_s_o, params.stride_h_o, params.max_splits,
-                   params.num_reduce_tile, (int)params.output_lse,
-                   (int)params.use_reduce_final_map);
+            if(const char* akao_phase = getenv("AKAO_PHASE"))
+            {
+                printf("[akao][%s] kn_mla_reduce_v1 grid=(%d,%d,%d) block=%d lds=%d"
+                       " kSizeDV=%d kNumHeadQ=%d kNumThreadGroupPerBh=%d"
+                       " stride_s_o=%d stride_h_o=%d max_splits=%d num_reduce_tile=%d"
+                       " output_lse=%d use_reduce_final_map=%d\n",
+                       akao_phase, grid.x, grid.y, grid.z, Traits::kNumThreads, lds_size,
+                       Traits::kSizeDV, Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh,
+                       params.stride_s_o, params.stride_h_o, params.max_splits,
+                       params.num_reduce_tile, (int)params.output_lse,
+                       (int)params.use_reduce_final_map);
+            }
             kn_mla_reduce_v1<Traits, lse_t, out_t>
                 <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
         }
         else
         {
             const dim3 grid = dim3(ps_grid_size);
-            printf("[akao] kn_mla_reduce_v1_ps grid=(%d,1,1) block=%d lds=%d"
-                   " kSizeDV=%d kNumHeadQ=%d kNumThreadGroupPerBh=%d"
-                   " stride_s_o=%d stride_h_o=%d max_splits=%d num_reduce_tile=%d"
-                   " output_lse=%d use_reduce_final_map=%d\n",
-                   grid.x, Traits::kNumThreads, lds_size,
-                   Traits::kSizeDV, Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh,
-                   params.stride_s_o, params.stride_h_o, params.max_splits,
-                   params.num_reduce_tile, (int)params.output_lse,
-                   (int)params.use_reduce_final_map);
+            if(const char* akao_phase = getenv("AKAO_PHASE"))
+            {
+                printf("[akao][%s] kn_mla_reduce_v1_ps grid=(%d,1,1) block=%d lds=%d"
+                       " kSizeDV=%d kNumHeadQ=%d kNumThreadGroupPerBh=%d"
+                       " stride_s_o=%d stride_h_o=%d max_splits=%d num_reduce_tile=%d"
+                       " output_lse=%d use_reduce_final_map=%d\n",
+                       akao_phase, grid.x, Traits::kNumThreads, lds_size,
+                       Traits::kSizeDV, Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh,
+                       params.stride_s_o, params.stride_h_o, params.max_splits,
+                       params.num_reduce_tile, (int)params.output_lse,
+                       (int)params.use_reduce_final_map);
+            }
             kn_mla_reduce_v1_ps<Traits, lse_t, out_t>
                 <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
         }
