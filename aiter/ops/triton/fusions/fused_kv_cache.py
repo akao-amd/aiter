@@ -130,6 +130,12 @@ def fused_qk_rope_cat_and_cache_mla(
         dk_nope + dk2 == d_cache
     ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
+    if b_slot > 0 and not torch.cuda.is_current_stream_capturing():
+        sm_max = slot_mapping.max().item()
+        assert sm_max < b_cache, (
+            f"slot_mapping OOB: max={sm_max} >= kv_cache dim0={b_cache}, "
+            f"b={b} qh={qh} kh={kh} b_slot={b_slot}"
+        )
     d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
