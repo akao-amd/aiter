@@ -3,6 +3,7 @@ import triton
 import torch
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_static_fp8,
+    _downcast_to_static_fp8_gather,
     _downcast_to_mxfp,
     _upcast_from_mxfp,
     _smoothquant_fuse_quant_kernel,
@@ -46,6 +47,52 @@ def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
         y.stride(0),
         y.stride(1),
         scale,
+        M,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps=8,
+    )
+
+    return y
+
+
+def downcast_to_static_fp8_gather(
+    hidden_states: torch.Tensor,
+    scale: torch.Tensor,
+    gather_src_idx: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Fused gather + fp8 quantize in one Triton kernel.
+    Reads hidden_states[gather_src_idx[i]//topk, :] for each output row i,
+    eliminating both the integer-divide and gather bf16 buffer."""
+    if get_arch() != "gfx942":
+        dtype = torch.float8_e4m3fn
+    else:
+        dtype = torch.float8_e4m3fnuz
+
+    if gather_src_idx.dtype != torch.int32:
+        gather_src_idx = gather_src_idx.to(torch.int32)
+
+    M = gather_src_idx.shape[0]
+    N = hidden_states.shape[1]
+    y = torch.empty((M, N), dtype=dtype, device=hidden_states.device)
+
+    BLOCK_M = min(triton.next_power_of_2(M), 128)
+    BLOCK_N = 32 if M <= 4096 else 64
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
+
+    _downcast_to_static_fp8_gather[(grid_m, grid_n)](
+        hidden_states,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        scale,
+        gather_src_idx,
+        topk,
         M,
         N,
         BLOCK_M,

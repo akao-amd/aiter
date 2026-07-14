@@ -58,6 +58,62 @@ def _downcast_to_static_fp8(
 
 
 @triton.jit
+def _downcast_to_static_fp8_gather(
+    x_ptr,          # hidden_states [T, N]
+    stride_x_m,
+    stride_x_n,
+    y_ptr,          # fp8 output [M, N]
+    stride_y_m,
+    stride_y_n,
+    scale_ptr,
+    gather_src_ptr, # int32 [M]: raw routing indices from aiter routing()
+    topk,           # int32: source_row = gather_src_ptr[i] // topk
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused gather + fp8 quantize: divides routing indices and gathers
+    hidden_states rows in a single kernel, no intermediate bf16 buffer."""
+    x_dtype: tl.constexpr = x_ptr.dtype.element_ty
+    tl.static_assert(
+        (x_dtype == tl.bfloat16) or (x_dtype == tl.float16) or (x_dtype == tl.float32),
+        f"{x_dtype=} must be bfloat16 or float16 or float32",
+    )
+
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+
+    start_m = pid_m * BLOCK_M
+    start_n = pid_n * BLOCK_N
+
+    y_ptr += start_m * stride_y_m + start_n * stride_y_n
+
+    offs_m = tl.arange(0, BLOCK_M)[None, :].to(tl.int64)  # [1, BLOCK_M]
+    offs_n = tl.arange(0, BLOCK_N)[:, None].to(tl.int64)  # [BLOCK_N, 1]
+
+    mask_m = start_m + offs_m < M
+    mask_n = start_n + offs_n < N
+    mask_xy = mask_m & mask_n
+
+    offs_y = offs_m * stride_y_m + offs_n * stride_y_n
+
+    # Load raw routing indices (1-D), divide to get source token rows, broadcast to 2-D
+    lane_m = (start_m + tl.arange(0, BLOCK_M)).to(tl.int64)  # [BLOCK_M]
+    mask_lane = lane_m < M
+    raw_idx = tl.load(gather_src_ptr + lane_m, mask=mask_lane, other=0).to(tl.int64)
+    src_rows = raw_idx // topk           # [BLOCK_M]
+    src_rows_2d = src_rows[None, :]      # [1, BLOCK_M]
+
+    offs_x = src_rows_2d * stride_x_m + (start_n + offs_n) * stride_x_n
+    x = tl.load(x_ptr + offs_x, mask=mask_xy)
+
+    y = _compute_static_fp8_quant(x, tl.load(scale_ptr))
+
+    tl.store(y_ptr + offs_y, y, mask=mask_xy)
+
+
+@triton.jit
 def _get_max_quant_val(dtype: tl.constexpr):
     if dtype == tl.uint8:
         return 6.0
