@@ -2715,7 +2715,11 @@ def get_2stage_cfgs(
         and not doweight_stage1
         and is_flydsl_available()
     )
-    use_mxfp4_flydsl = _is_a16w4_situv2 or (
+    # gfx1250: _flydsl_stage1_wrapper compiles mixed_moe_gemm_2stage_common which
+    # uses raw_ptr_buffer_load_lds — LLVM cannot lower this on gfx1250. The
+    # grouped_gemm_gfx1250_a8w4 path (line ~810) handles gfx1250 instead and
+    # already returned if gate_mode == GateMode.INTERLEAVE.
+    use_mxfp4_flydsl = get_gfx() != "gfx1250" and (_is_a16w4_situv2 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
@@ -2730,7 +2734,7 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
         and is_flydsl_available()
-    )
+    ))
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
