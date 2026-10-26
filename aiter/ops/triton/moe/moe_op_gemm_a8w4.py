@@ -2,6 +2,7 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+import os
 
 import torch
 import triton
@@ -102,6 +103,18 @@ def allocate_output(
     return matmul_output, final_output
 
 
+def _decode_num_stages(block_m, num_stages):
+    # Default off. AITER_TRITON_A8W4_BM16_NUM_STAGES=<n> overrides num_stages of the
+    # tuned block_m=16 (decode) entries only. On gfx1250 num_stages>=2 stages the
+    # tiles through global_load_async_to_lds; num_stages=1 loads through registers,
+    # which measured faster for small-M decode. Tile shape, K order and epilogue are
+    # unchanged, so results are bitwise identical.
+    v = os.environ.get("AITER_TRITON_A8W4_BM16_NUM_STAGES", "")
+    if block_m != 16 or not v.strip():
+        return num_stages
+    return int(v)
+
+
 def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
@@ -122,7 +135,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             "block_n": tuned["BLOCK_SIZE_N"],
             "block_k": tuned["BLOCK_SIZE_K"],
             "num_warps": tuned["num_warps"],
-            "num_stages": tuned["num_stages"],
+            "num_stages": _decode_num_stages(block_m, tuned["num_stages"]),
             "group_m": group_m,
             "xcd_swizzle": xcd_swizzle,
             "w_cache_modifier": w_cache_modifier,
