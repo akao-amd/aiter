@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
+import sys
 from typing import NamedTuple
 
 import torch
@@ -32,6 +34,22 @@ try:
     )
 except:  # noqa: E722
     _unified_attention_kernel_2d_gfx1250 = None
+# lane6 candidate C1 (default off): AITER_GFX1250_UA2D_RUNTIME_SEQ=1 selects the 2d kernel variant whose
+# num_seqs / block_table_stride are runtime arguments, so new batch shapes do not force a fresh JIT compile.
+# Floating-point arithmetic is unchanged. Import errors are NOT swallowed on this path.
+_UA2D_RUNTIME_SEQ = os.environ.get("AITER_GFX1250_UA2D_RUNTIME_SEQ", "0")
+if _UA2D_RUNTIME_SEQ not in ("0", "1"):
+    raise ValueError(f"AITER_GFX1250_UA2D_RUNTIME_SEQ={_UA2D_RUNTIME_SEQ!r}: expected 0 or 1")
+if _UA2D_RUNTIME_SEQ == "1":
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d_rtseq import (
+        _unified_attention_gluon_kernel_2d as _unified_attention_kernel_2d_gfx1250,
+    )
+print(
+    f"[aiter-ua2d] AITER_GFX1250_UA2D_RUNTIME_SEQ={_UA2D_RUNTIME_SEQ} 2d kernel from "
+    f"{getattr(getattr(_unified_attention_kernel_2d_gfx1250, 'fn', None), '__module__', None)}",
+    file=sys.stderr,
+    flush=True,
+)
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_gluon as _reduce_segments_kernel_gfx1250,
