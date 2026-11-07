@@ -12,7 +12,7 @@ float8_info = torch.finfo(e4m3_dtype)
 
 # fp8 PV (6003): P in (0, 1] cast unscaled to e4m3 flushes p < 2^-9 to zero; scale it for the dot and
 # divide the scale back out where the output is normalized.
-P_FP8_SCALE: tl.constexpr = 256.0
+P_FP8_SCALE = tl.constexpr(256.0)
 
 
 @triton.jit
@@ -374,11 +374,11 @@ def kernel_unified_attention_2d(
             acc = acc * alpha[:, None]
             L = L * alpha + l_j
             M = m_j
-            acc = tl.dot(
-                (P * P_FP8_SCALE).to(V.dtype) if V.dtype.is_fp8() else P.to(V.dtype),
-                V,
-                acc=acc,
-            )
+            if V.dtype.is_fp8():
+                P_mma = (P * P_FP8_SCALE).to(V.dtype)
+            else:
+                P_mma = P.to(V.dtype)
+            acc = tl.dot(P_mma, V, acc=acc)
 
         masked_tile_start = unmasked_tile_end
 
@@ -534,11 +534,11 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(
-            (P * P_FP8_SCALE).to(V.dtype) if V.dtype.is_fp8() else P.to(V.dtype),
-            V,
-            acc=acc,
-        )
+        if V.dtype.is_fp8():
+            P_mma = (P * P_FP8_SCALE).to(V.dtype)
+        else:
+            P_mma = P.to(V.dtype)
+        acc = tl.dot(P_mma, V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -955,11 +955,11 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(
-            (P * P_FP8_SCALE).to(V.dtype) if V.dtype.is_fp8() else P.to(V.dtype),
-            V,
-            acc=acc,
-        )
+        if V.dtype.is_fp8():
+            P_mma = (P * P_FP8_SCALE).to(V.dtype)
+        else:
+            P_mma = P.to(V.dtype)
+        acc = tl.dot(P_mma, V, acc=acc)
 
     if Q.dtype.is_fp8():
         out_factor = out_factor * (1.0 / P_FP8_SCALE)
