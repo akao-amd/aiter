@@ -109,6 +109,7 @@ _AXIS_KIND = {
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
+    "NS": "num",  # num_seqs in the launch (mixed prefill+decode batches carry many)
 }
 
 
@@ -262,6 +263,7 @@ def _axis_values(
     q_dtype,
     kv_dtype,
     num_queries_per_kv,
+    num_seqs=1,
 ) -> dict:
     return {
         "D": head_size,
@@ -272,6 +274,7 @@ def _axis_values(
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "NS": num_seqs,
     }
 
 
@@ -313,6 +316,7 @@ def _get_unified_attention_config_cached(
     num_queries_per_kv: int,
     backend: str,
     arch: str | None,
+    num_seqs: int = 1,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -329,9 +333,15 @@ def _get_unified_attention_config_cached(
         q_dtype,
         kv_dtype,
         num_queries_per_kv,
+        num_seqs,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
+
+
+@functools.lru_cache(maxsize=64)
+def _uses_ns(op: str, backend, arch) -> bool:
+    return "NS" in _load(op, backend, arch)[1]
 
 
 def get_unified_attention_config(
@@ -367,6 +377,8 @@ def get_unified_attention_config(
         params.num_queries_per_kv,
         backend,
         arch,
+        # only a table whose schema names NS reads it; keep the cache key small otherwise
+        params.num_seqs if _uses_ns(op, backend, arch) else 1,
     )
     config = copy.deepcopy(config)
     if _ua3d_nhd_override_applies(op, params, backend, arch):
@@ -389,6 +401,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.q_dtype,
         params.kv_cache_dtype,
         params.num_queries_per_kv,
+        params.num_seqs,
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
