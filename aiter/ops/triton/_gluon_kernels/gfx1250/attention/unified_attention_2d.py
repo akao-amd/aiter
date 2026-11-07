@@ -2106,7 +2106,9 @@ def _unified_attention_gluon_kernel_2d(
                 other=float("-inf"),
             ).to(dtype=gl.float32)
             # NOTE: See softmax0 why
-            M = M / SCALE
+            # S stays in raw q.k units (q/k descales are folded into QK_scale), so the sink logit
+            # must be divided by the whole scale, descales included (6003: was M / SCALE).
+            M = M * (pgm.cfg.RCP_LN2 / pgm.QK_scale)
         else:
             M = gl.full(
                 [BLOCK_M],
