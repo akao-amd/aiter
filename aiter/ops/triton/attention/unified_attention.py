@@ -827,6 +827,10 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
     # TDM stores of LDS-staged output can corrupt some gfx1250 decode rows.
     # Those shapes set USE_TDM_STORE false; every other shape keeps TDM stores.
+    # gpt-oss extend (head 64, 8 queries per kv head, page 64) sets it false too. Extend's register path needs a
+    # Triton whose LLVM keeps the s_wait_dscnt before the main loop's workgroup barrier on gfx1250
+    # (llvm/llvm-project#220357, or Triton emitting the wait itself): without it the next K/V tile can overwrite
+    # LDS another wave still reads.
     USE_TDM_STORE = config.pop("USE_TDM_STORE", True)
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
