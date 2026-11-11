@@ -13,6 +13,20 @@ float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
+# fp8 PV: P = exp(S - m) is in (0, 1]; cast unscaled to e4m3 every p < 2^-9 flushes to zero and
+# p < 2^-6 keeps fewer mantissa bits, which loses the long tail of a long-context softmax (the row sum L
+# is taken before the cast, so the output is biased low). Scale P into e4m3's range for the MMA and
+# divide it back out with out_scale (6003).
+_P_FP8_SCALE = gl.constexpr(256.0)
+
+
+@gluon.jit
+def _cast_p(p, dtype: gl.constexpr):
+    if dtype.is_fp8():
+        return (p * _P_FP8_SCALE).to(dtype)
+    else:
+        return p.to(dtype)
+
 
 @gluon.jit
 def elementwise_max_prop_nan(a, b):
@@ -835,6 +849,8 @@ class AttentionProgram:
             out_scale = 1.0
         if v_descale_ptr is not None:
             out_scale = out_scale * gl.load(v_descale_ptr)
+        if q.dtype.is_fp8():
+            out_scale = out_scale * (1.0 / _P_FP8_SCALE)
 
         return AttentionProgram(
             cfg,
@@ -933,7 +949,7 @@ class AttentionProgram:
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
         if target_dtype != gl.bfloat16:
-            p = p.to(target_dtype)
+            p = _cast_p(p, target_dtype)
         else:
             p = p.to(target_dtype, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
@@ -1171,7 +1187,7 @@ class AttentionProgram:
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
         if target_dtype != gl.bfloat16:
-            p = p.to(target_dtype)
+            p = _cast_p(p, target_dtype)
         else:
             p = p.to(target_dtype, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
@@ -1578,7 +1594,7 @@ def attention_loop_tensor_subtile_split(
         p = pgm.concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
         L = L * alpha + l_ij
-        p = p.to(q.dtype)
+        p = _cast_p(p, q.dtype)
         k = kv_loader.load_k_from_shared(
             wait_count=2,
             buffer_id=buf_tile_next2,
@@ -1658,7 +1674,7 @@ def attention_loop_tensor_subtile_split(
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
 
     if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -1713,7 +1729,7 @@ def attention_loop_tensor_subtile_split(
     qk1 = pgm.compute_qk_subtile(k1_s)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
     qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
     v0_s, v1_s = pgm.split_subtile(v)
@@ -1748,7 +1764,7 @@ def attention_loop_tensor_subtile_split(
     acc0 = acc0 * alpha[:, None]
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
 
     v0_s, v1_s = pgm.split_subtile(v)
     acc0 = pgm.compute_pv(p, v0_s, acc0)
@@ -2090,7 +2106,9 @@ def _unified_attention_gluon_kernel_2d(
                 other=float("-inf"),
             ).to(dtype=gl.float32)
             # NOTE: See softmax0 why
-            M = M / SCALE
+            # S stays in raw q.k units (q/k descales are folded into QK_scale), so the sink logit
+            # must be divided by the whole scale, descales included (6003: was M / SCALE).
+            M = M * (pgm.cfg.RCP_LN2 / pgm.QK_scale)
         else:
             M = gl.full(
                 [BLOCK_M],
