@@ -1533,6 +1533,88 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        # max_seqlen_k < 2048: the SKLT config, loop variant 0 (softmax_part1's cast)
+        [(512, 1536)] * 2,
+        # the fp8 prefill config, loop variant 2 (the subtile split loop's casts)
+        [(1024, 2048)] * 2,
+        [(64, 16384)],
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_fp8_long_tail_gfx1250(seq_lens, monkeypatch):
+    """fp8 P on the gfx1250 Gluon 2D kernel: P below 2^-9 must reach the PV MMA, not
+    flush to zero in the e4m3 cast."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    # the 3D kernel still casts P unscaled
+    monkeypatch.setattr(
+        sys.modules[unified_attention.__module__],
+        "use_2d_kernel",
+        lambda params, backend="triton": True,
+    )
+    # every 32nd key is 7.5 above the rest, so each tile's tail has P ~ e^-7.5, below
+    # e4m3's smallest step; V is 0 on the hot keys, so the output is the tail alone
+    block_size = 64
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=128,
+            num_heads=(8, 1),
+        )[:14]
+    )
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    q = torch.zeros(q.shape, dtype=torch.float32, device="cuda")
+    q[..., 0] = 7.5 / scale
+    k = torch.zeros(k.shape, dtype=torch.float32, device="cuda")
+    k[:, ::32, :, 0] = 1.0
+    v = torch.ones(v.shape, dtype=torch.float32, device="cuda")
+    v[:, ::32] = 0.0
+    q, k, v = q.to(e4m3_dtype), k.to(e4m3_dtype), v.to(e4m3_dtype)
+    shuffled_k, shuffled_v = shuffle_kv_cache(k, v)
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        q_descale=one,
+        k_descale=one,
+        v_descale=one,
+    ).float()
+
+    unified_attention(
+        q=q,
+        k=shuffled_k,
+        v=shuffled_v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=one,
+        k_descale=one,
+        v_descale=one,
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
         # uneven: a big chunk over a short context next to a few tokens over a long one
         # -> 3D above the program cap, with the split widened
         [(3000, 6000), (8, 20000)],
