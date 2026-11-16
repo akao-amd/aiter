@@ -1435,8 +1435,10 @@ class AttentionProgram:
     def p_offset(self, m_ij, m_ij_scaled):
         """What P's exponent subtracts: the row max m_ij_scaled = m_ij * QK_scale, lowered
         by P_EXP_SHIFT for an fp8 PV so that exp2 gives P * P_SCALE (see _P_FP8_SHIFT).
-        One fma, so it is rounded once: P's exponent then errs by at most half an ulp of
-        m_ij * QK_scale, as with the plain max (m_ij_scaled - 8 would round twice)."""
+        One fma, rounded once. Near |m_ij * QK_scale - 8| = 2^24 its rounding can reach a
+        whole unit and P can pass e4m3's 448: gfx1250's cast saturates (measured), but L
+        sums the unclipped P, so such a row comes out biased. That takes a huge row max
+        times QK_scale; a per-row guard cost 2.5% in fp8 prefill, so there is none."""
         if self.cfg.P_EXP_SHIFT != 0.0:
             layout: gl.constexpr = m_ij.type.layout
             qk_scale = gl.full(m_ij.shape, self.QK_scale, gl.float32, layout)
