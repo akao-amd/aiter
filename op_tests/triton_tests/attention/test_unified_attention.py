@@ -1612,6 +1612,80 @@ def test_unified_attn_fp8_long_tail_gfx1250(seq_lens, monkeypatch):
     torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=5e-2)
 
 
+@torch.inference_mode()
+def test_unified_attn_zero_q_descale_sink_gfx1250(monkeypatch):
+    """A zero q descale with a zero sink on the gfx1250 Gluon 2D kernel: the sink is
+    divided by the QK scale, which must not make it NaN. One decode query over 128
+    keys, none of them masked, V all ones: every logit and the sink are 0, so the
+    output is 128 / 129."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    monkeypatch.setattr(
+        sys.modules[unified_attention.__module__],
+        "use_2d_kernel",
+        lambda params, backend="triton": True,
+    )
+    num_keys = 128
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        _key_cache,
+        _value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=[(1, num_keys)],
+        num_blocks=num_keys // 64,
+        block_size=64,
+        head_size=128,
+        num_heads=(8, 1),
+        q_dtype=e4m3_dtype,
+        kv_dtype=e4m3_dtype,
+        shuffled_kv_cache=True,
+    )
+    value_cache_orig = torch.ones(
+        value_cache_orig.shape, dtype=torch.float32, device="cuda"
+    ).to(e4m3_dtype)
+    key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+    zero = torch.zeros(1, dtype=torch.float32, device="cuda")
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        max_seqlen_q=max_seqlen_q,
+        seqused_k=kv_lens,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=zero,
+        k_descale=one,
+        v_descale=one,
+        sinks=torch.zeros_like(sinks),
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+    assert not output.isnan().any()
+    expected = torch.full(
+        output.shape, num_keys / (num_keys + 1), dtype=torch.float32, device="cuda"
+    )
+    torch.testing.assert_close(output.float(), expected, atol=4e-3, rtol=0)
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [

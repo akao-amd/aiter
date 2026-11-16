@@ -2933,8 +2933,13 @@ def _unified_attention_gluon_kernel_2d(
                 mask=query_mask_1_pv,
                 other=float("-inf"),
             ).to(dtype=gl.float32)
-            # S is raw q.k, so the sink is divided by the full QK scale, descales included
-            M = M * (pgm.cfg.RCP_LN2 / pgm.QK_scale)
+            # S is raw q.k, so the sink is divided by the full QK scale, descales included.
+            # A zero q/k descale would make that 0 * inf (NaN) for a zero sink and inf
+            # for any other; it divides by RCP_LN2 instead, so the sink stays finite and
+            # M * QK_scale is 0, as before the sink used the descales. Every non-zero
+            # scale divides as before: adding 0.0 leaves it unchanged.
+            zero_qk = (pgm.QK_scale == 0.0).to(gl.float32)
+            M = M * (pgm.cfg.RCP_LN2 / (pgm.QK_scale + zero_qk * pgm.cfg.RCP_LN2))
         else:
             M = gl.full(
                 [BLOCK_M],
