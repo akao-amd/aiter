@@ -16,17 +16,10 @@ float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
-# e4m3 flushes P < 2^-9 to zero, so P is scaled into range for the PV MMA and out_scale
-# divides it back out.
-_P_FP8_SCALE = gl.constexpr(256.0)
-
-
-@gluon.jit
-def _cast_p(p, dtype: gl.constexpr):
-    if dtype.is_fp8():
-        return (p * _P_FP8_SCALE).to(dtype)
-    else:
-        return p.to(dtype)
+# e4m3 flushes P < 2^-9 to zero, so an fp8 PV takes P * 2^8 = exp2(x + 8) instead: P's
+# exponent is taken against the row max lowered by 8 (one subtraction per row, none per
+# element). L sums the same P, so acc / L needs no correction; alpha keeps the plain max.
+_P_FP8_SHIFT = gl.constexpr(8.0)
 
 
 # tdm.async_gather takes a source column in upstream Triton (desc, rows, col, dst) but not in every gfx1250 build
@@ -152,6 +145,9 @@ class AttentionConfig:
     # the K cache (and the V cache unless V_NVFP4 says otherwise)
     KV_NVFP4: gl.constexpr
     V_NVFP4: gl.constexpr
+    # P is computed as P * 2^P_EXP_SHIFT = P * P_SCALE (an fp8 PV; see _P_FP8_SHIFT)
+    P_EXP_SHIFT: gl.constexpr
+    P_SCALE: gl.constexpr
     SCALE_PRESHUFFLE: gl.constexpr
     K_OPS: gl.constexpr
     V_OPS: gl.constexpr
@@ -309,6 +305,10 @@ class AttentionConfig:
         V_NVFP4 = KV_NVFP4 if V_NVFP4 is None else V_NVFP4
         assert V_NVFP4 == KV_NVFP4 or (KV_NVFP4 and Q_FP8)
         self.V_NVFP4 = gl.constexpr(V_NVFP4)
+        # an NVFP4 V runs a BF16 PV, so its P is not scaled
+        p_shift = _P_FP8_SHIFT.value if (Q_FP8 and not V_NVFP4) else 0.0
+        self.P_EXP_SHIFT = gl.constexpr(p_shift)
+        self.P_SCALE = gl.constexpr(2.0**p_shift)
         # NVFP4 scales are preshuffled in groups of this many page rows (128, or the page when shorter)
         self.SCALE_PRESHUFFLE = gl.constexpr(min(128, BLOCK_SIZE))
         # TDM ops per page load: data, plus the scales of an NVFP4 cache (see _tdm_ops_after)
@@ -1376,9 +1376,6 @@ class AttentionProgram:
             out_scale = 1.0
         if v_descale_ptr is not None:
             out_scale = out_scale * gl.load(v_descale_ptr)
-        # an NVFP4 V runs a BF16 PV, so its P is not scaled
-        if q.dtype.is_fp8() and not cfg.V_NVFP4:
-            out_scale = out_scale * (1.0 / _P_FP8_SCALE)
 
         return AttentionProgram(
             cfg,
@@ -1435,13 +1432,22 @@ class AttentionProgram:
         return S
 
     @gluon.jit
+    def p_offset(self, m_ij_scaled):
+        """What P's exponent subtracts: the row max, lowered by P_EXP_SHIFT for an fp8
+        PV so that exp2 gives P * P_SCALE (see _P_FP8_SHIFT)."""
+        if self.cfg.P_EXP_SHIFT != 0.0:
+            return m_ij_scaled - self.cfg.P_EXP_SHIFT
+        else:
+            return m_ij_scaled
+
+    @gluon.jit
     def softmax_part0(self, S, M):
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         # Guard against all-masked rows
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+        q_shifted = S * self.QK_scale - self.p_offset(m_ij_scaled)[:, None]
         p = gl.exp2(q_shifted)
         m_diff_scaled = M * self.QK_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
@@ -1454,7 +1460,7 @@ class AttentionProgram:
         # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+        q_shifted = S * self.QK_scale - self.p_offset(m_ij_scaled)[:, None]
         q_shifted = q_shifted.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2, 2)
         q_shift1, q_shift2 = gl.split(q_shifted)
         q_shift1 = q_shift1.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 4, 2)
@@ -1489,7 +1495,7 @@ class AttentionProgram:
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
         if target_dtype != gl.bfloat16 and not self.cfg.V_NVFP4:
-            p = _cast_p(p, target_dtype)
+            p = p.to(target_dtype)
         else:
             # NVFP4 V: the PV WMMA is BF16 whatever the Q dtype
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
@@ -1848,7 +1854,7 @@ class AttentionProgram:
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
         if target_dtype != gl.bfloat16:
-            p = _cast_p(p, target_dtype)
+            p = p.to(target_dtype)
         else:
             p = p.to(target_dtype, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
@@ -2225,6 +2231,7 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
+    m_p = pgm.p_offset(m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
@@ -2235,8 +2242,8 @@ def attention_loop_tensor_subtile_split(
     if cfg.KV_NVFP4:
         k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next)
 
-    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    qk0_shifted = qk0 * QK_scale - m_p[:, None]
+    qk1_shifted = qk1 * QK_scale - m_p[:, None]
     p0 = gl.exp2(qk0_shifted)
 
     # ---- Steady-state loop ----
@@ -2293,7 +2300,7 @@ def attention_loop_tensor_subtile_split(
         p = pgm.concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
         L = L * alpha + l_ij
-        p = _cast_p(p, q.dtype)
+        p = p.to(q.dtype)
         k = kv_loader.load_k_from_shared(
             later="VK",
             wait_count=2,
@@ -2312,6 +2319,7 @@ def attention_loop_tensor_subtile_split(
         m = reduce_max_prop_nan(qk, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
+        m_p = pgm.p_offset(m_ij_scaled)
         m_diff_scaled = M * QK_scale - m_ij_scaled
         M = m_ij
         alpha = gl.exp2(m_diff_scaled)
@@ -2322,8 +2330,8 @@ def attention_loop_tensor_subtile_split(
 
         # --- S4: PV sub 1 + SM0-B ---
         acc1 = pgm.compute_pv(p, v1_s, acc1)
-        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+        qk0_shifted = qk0 * QK_scale - m_p[:, None]
+        qk1_shifted = qk1 * QK_scale - m_p[:, None]
         p0 = gl.exp2(qk0_shifted)
 
         next2_physical_block_idx, next3_physical_block_idx = (
@@ -2385,7 +2393,7 @@ def attention_loop_tensor_subtile_split(
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = _cast_p(p, q.dtype)
+    p = p.to(q.dtype)
 
     if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -2408,14 +2416,15 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
+    m_p = pgm.p_offset(m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
 
     # --- S4: PV sub 1 for L + SM0-B for L+1 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
-    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    qk0_shifted = qk0 * QK_scale - m_p[:, None]
+    qk1_shifted = qk1 * QK_scale - m_p[:, None]
     p0_next = gl.exp2(qk0_shifted)
 
     if MERGE_EPI_TDM_WAITS:
@@ -2452,7 +2461,7 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.compute_qk_subtile(k1_s)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = _cast_p(p, q.dtype)
+    p = p.to(q.dtype)
     qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
     v0_s, v1_s = pgm.split_subtile(v)
@@ -2465,6 +2474,7 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
+    m_p = pgm.p_offset(m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
@@ -2478,8 +2488,8 @@ def attention_loop_tensor_subtile_split(
     )
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
-    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    qk0_shifted = qk0 * QK_scale - m_p[:, None]
+    qk1_shifted = qk1 * QK_scale - m_p[:, None]
     p0_next = gl.exp2(qk0_shifted)
     p1_next = gl.exp2(qk1_shifted)
     p = pgm.concat_subtile(p0_next, p1_next)
@@ -2488,7 +2498,7 @@ def attention_loop_tensor_subtile_split(
     acc0 = acc0 * alpha[:, None]
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = _cast_p(p, q.dtype)
+    p = p.to(q.dtype)
 
     v0_s, v1_s = pgm.split_subtile(v)
     acc0 = pgm.compute_pv(p, v0_s, acc0)
@@ -2948,8 +2958,13 @@ def _unified_attention_gluon_kernel_2d(
                 layout=gl.SliceLayout(1, cfg.pv_layout),
             )
 
+    # the sink's weight, exp2(0), in P's units (P_SCALE); without a sink, the first
+    # alpha (M = -inf) zeroes it
     L = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
+        [BLOCK_M],
+        cfg.P_SCALE,
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, cfg.pv_layout),
     )
 
     if LOOP_VARIANT == 0:
