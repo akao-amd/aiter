@@ -1432,11 +1432,16 @@ class AttentionProgram:
         return S
 
     @gluon.jit
-    def p_offset(self, m_ij_scaled):
-        """What P's exponent subtracts: the row max, lowered by P_EXP_SHIFT for an fp8
-        PV so that exp2 gives P * P_SCALE (see _P_FP8_SHIFT)."""
+    def p_offset(self, m_ij, m_ij_scaled):
+        """What P's exponent subtracts: the row max m_ij_scaled = m_ij * QK_scale, lowered
+        by P_EXP_SHIFT for an fp8 PV so that exp2 gives P * P_SCALE (see _P_FP8_SHIFT).
+        One fma, so it is rounded once: P's exponent then errs by at most half an ulp of
+        m_ij * QK_scale, as with the plain max (m_ij_scaled - 8 would round twice)."""
         if self.cfg.P_EXP_SHIFT != 0.0:
-            return m_ij_scaled - self.cfg.P_EXP_SHIFT
+            layout: gl.constexpr = m_ij.type.layout
+            qk_scale = gl.full(m_ij.shape, self.QK_scale, gl.float32, layout)
+            shift = gl.full(m_ij.shape, -self.cfg.P_EXP_SHIFT, gl.float32, layout)
+            return gl.fma(m_ij, qk_scale, shift)
         else:
             return m_ij_scaled
 
@@ -1447,7 +1452,7 @@ class AttentionProgram:
         # Guard against all-masked rows
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - self.p_offset(m_ij_scaled)[:, None]
+        q_shifted = S * self.QK_scale - self.p_offset(m_ij, m_ij_scaled)[:, None]
         p = gl.exp2(q_shifted)
         m_diff_scaled = M * self.QK_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
@@ -1460,7 +1465,7 @@ class AttentionProgram:
         # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - self.p_offset(m_ij_scaled)[:, None]
+        q_shifted = S * self.QK_scale - self.p_offset(m_ij, m_ij_scaled)[:, None]
         q_shifted = q_shifted.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2, 2)
         q_shift1, q_shift2 = gl.split(q_shifted)
         q_shift1 = q_shift1.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 4, 2)
@@ -2231,7 +2236,7 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
-    m_p = pgm.p_offset(m_ij_scaled)
+    m_p = pgm.p_offset(m_ij, m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
@@ -2319,7 +2324,7 @@ def attention_loop_tensor_subtile_split(
         m = reduce_max_prop_nan(qk, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
-        m_p = pgm.p_offset(m_ij_scaled)
+        m_p = pgm.p_offset(m_ij, m_ij_scaled)
         m_diff_scaled = M * QK_scale - m_ij_scaled
         M = m_ij
         alpha = gl.exp2(m_diff_scaled)
@@ -2416,7 +2421,7 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
-    m_p = pgm.p_offset(m_ij_scaled)
+    m_p = pgm.p_offset(m_ij, m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
@@ -2474,7 +2479,7 @@ def attention_loop_tensor_subtile_split(
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
-    m_p = pgm.p_offset(m_ij_scaled)
+    m_p = pgm.p_offset(m_ij, m_ij_scaled)
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
