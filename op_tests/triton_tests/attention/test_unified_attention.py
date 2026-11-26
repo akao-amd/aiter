@@ -1639,7 +1639,10 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
         ("fp16 out", 64, 64, 8, 64, b, b, f, 1, False, 64),
         ("tp2", 64, 64, 4, 64, b, b, b, 1, True, 64),
         ("page 16", 64, 64, 8, 16, b, b, b, 1, True, 64),
-        ("extend", 64, 64, 8, 64, b, b, b, 128, True, 64),
+        # gpt-oss extend (G 8, page 64) stores from registers since the extend register
+        # store: its gpt-oss rows (BS_EQ_64.G_EQ_8) set USE_TDM_STORE false.
+        ("extend", 64, 64, 8, 64, b, b, b, 128, False, 64),
+        ("extend tp2", 64, 64, 4, 64, b, b, b, 128, True, 64),
     ]
     for case in cases:
         name, hq, hv, group, page, q_dtype, kv_dtype, out_dtype, q_len, tdm, tile = case
