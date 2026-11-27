@@ -1166,7 +1166,9 @@ def kernel_unified_attention_decode_2h(
     sel = tl.arange(0, 2)[None, :, None] == (offs_m // 8)[:, None, None]
     out = tl.sum(tl.where(sel, acc3, 0.0), axis=1)
     if NUM_SEGMENTS_PER_SEQ == 1:
-        out = out / L[:, None]
+        # same rounding as kernel_unified_attention_3d: multiply by the reciprocal
+        one_over_L = 1.0 / L[:, None]
+        out = out * one_over_L
     offs_d = tl.arange(0, HD)
     segm_output_offset = (
         seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HD)
