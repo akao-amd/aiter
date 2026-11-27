@@ -465,6 +465,118 @@ def test_triton_unified_attn_decode_kv_head_first(
     "batch_size, max_kv_len", [(8, 65537), (8, 1025), (44, 4097), (168, 513), (168, 33000)]
 )
 @pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("q_fp8", [False, True])
+@torch.inference_mode()
+def test_unified_attn_decode_two_heads(
+    num_heads, batch_size, max_kv_len, use_sinks, q_fp8, monkeypatch
+):
+    """AITER_UA_DECODE_TWO_HEADS: the two-KV-heads producer matches the default 3D decode."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Triton decode")
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    seq_lens = [
+        (1, max(1, max_kv_len - (i % 7) * 63 - (i % 3))) for i in range(batch_size)
+    ]
+    seq_lens[1:4] = [(1, 64), (1, 65), (1, 1)]
+    seq_lens += [(0, 0), (0, 0)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * triton.cdiv(max_kv_len, 64),
+        block_size=64,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=e4m3_dtype if q_fp8 else torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    assert block_tables.shape == (len(seq_lens), triton.cdiv(max_kv_len, 64))
+    assert ((block_tables >= 0) & (block_tables < key_cache.shape[0])).all()
+    kwargs = dict(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks if use_sinks else None,
+        decode_kv_head_first=True,
+    )
+    live = int(cu_query_lens[-1].item())
+    monkeypatch.setattr(ua, "_UA_DECODE_HOIST", True)
+
+    def both(out_ref, out_new):
+        monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", False)
+        unified_attention(out=out_ref, **kwargs)
+        monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", True)
+        unified_attention(out=out_new, **kwargs)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out_new[:live]).all()
+        torch.testing.assert_close(out_new[:live], out_ref[:live], rtol=0, atol=0)
+
+    two = torch.full_like(output, float("nan"))
+    both(output, two)
+
+    # captured with the two-heads producer, replayed with new Q and lengths moving 64 <-> 65
+    monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", True)
+    graph_out = torch.empty_like(output)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        unified_attention(out=graph_out, **kwargs)
+    reference = torch.empty_like(output)
+    for step, (len1, len2) in enumerate(((64, 65), (65, 64), (64, 65))):
+        kv_lens[1] = len1
+        kv_lens[2] = len2
+        if q_fp8:
+            query.view(torch.uint8).bitwise_xor_(0x80)
+        else:
+            query.neg_()
+        graph_out.fill_(float("nan"))
+        g.replay()
+        monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", False)
+        unified_attention(out=reference, **kwargs)
+        monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", True)
+        torch.cuda.synchronize()
+        assert torch.isfinite(graph_out[:live]).all(), step
+        torch.testing.assert_close(graph_out[:live], reference[:live], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
+@pytest.mark.parametrize(
+    "batch_size, max_kv_len", [(8, 65537), (8, 1025), (44, 4097), (168, 513), (168, 33000)]
+)
+@pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("kv_head_first", [False, True])
 @pytest.mark.parametrize("q_fp8", [False, True])
 @torch.inference_mode()

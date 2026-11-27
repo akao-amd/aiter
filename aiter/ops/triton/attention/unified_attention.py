@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
+    kernel_unified_attention_decode_2h,
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
@@ -1104,6 +1105,70 @@ def _unified_attention_2d_triton(params: _UAParams):
 
 
 _UA_DECODE_HOIST = os.environ.get("AITER_UA_DECODE_HOIST", "0") == "1"
+# AITER_UA_DECODE_TWO_HEADS=1 (off by default): GQA-8 head-64 page-64 decode runs
+# kernel_unified_attention_decode_2h, one program for two adjacent KV heads (no padding rows).
+_UA_DECODE_TWO_HEADS = os.environ.get("AITER_UA_DECODE_TWO_HEADS", "0") == "1"
+
+
+def _decode_two_heads_applies(params: _UAParams, TILE_SIZE) -> bool:
+    k, v = params.k, params.v
+    return (
+        _UA_DECODE_TWO_HEADS
+        and params.all_decode
+        and not params.shuffled_kv_cache
+        and params.sliding_window <= 0
+        and not params.softcap
+        and not params.use_alibi_slopes
+        and not params.use_qq_bias
+        and params.output_scale is None
+        and params.num_queries_per_kv == 8
+        and params.num_kv_heads % 2 == 0
+        and params.head_size == params.head_size_v == 64
+        and params.block_size == TILE_SIZE == 64
+        and params.kv_cache_dtype == params.v_cache_dtype == e4m3_dtype
+        and params.q.stride(-1) == 1
+        and k.shape == v.shape
+        and k.stride(3) == 1
+        and k.stride(2) == 64
+        and v.stride(3) == 1
+        and v.stride(2) == 64
+    )
+
+
+def _unified_attention_decode_2h(
+    params: _UAParams, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, config
+):
+    kernel_unified_attention_decode_2h[
+        (params.num_kv_heads // 2, params.num_seqs, NUM_SEGMENTS)
+    ](
+        segm_output_ptr=segm_output,
+        segm_max_ptr=segm_max,
+        segm_expsum_ptr=segm_expsum,
+        query_ptr=params.q,
+        key_cache_ptr=params.k,
+        value_cache_ptr=params.v,
+        sink_ptr=params.sinks,
+        block_tables_ptr=params.block_table,
+        seq_lens_ptr=params.seqused_k,
+        scale=params.softmax_scale,
+        q_descale_ptr=params.q_descale,
+        k_descale_ptr=params.k_descale,
+        v_descale_ptr=params.v_descale,
+        num_query_heads=params.num_query_heads,
+        block_table_stride=params.block_table.stride(0),
+        query_stride_0=params.q.stride(0),
+        query_stride_1=params.q.stride(1),
+        stride_k_cache_0=params.k.stride(0),
+        stride_k_cache_1=params.k.stride(1),
+        stride_v_cache_0=params.v.stride(0),
+        stride_v_cache_1=params.v.stride(1),
+        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+        USE_SINKS=params.sinks is not None,
+        IS_Q_FP8=params.q_dtype == e4m3_dtype,
+        num_warps=config.get("num_warps", 1),
+        num_stages=config.get("num_stages", 3),
+        waves_per_eu=config.get("waves_per_eu", 2),
+    )
 
 
 def _unified_attention_3d_triton(
@@ -1126,6 +1191,12 @@ def _unified_attention_3d_triton(
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+
+    if _decode_two_heads_applies(params, TILE_SIZE):
+        _unified_attention_decode_2h(
+            params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, config
+        )
+        return
 
     kv_head_first = params.all_decode and params.decode_kv_head_first
     # AITER_UA_DECODE_HOIST=1 (off by default): plain-NHD decode with one page per
@@ -1777,7 +1848,7 @@ def _unified_attention_gfx950(
         BLOCK_M=BLOCK_M,
         MFMA_DIM=config["MFMA_DIM"],
         ARCH_NAME=DEVICE_ARCH,
-        waves_per_eu=config["waves_per_eu"],
+        waves_per_eu=config.get("waves_per_eu", 2),
         USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
@@ -1806,7 +1877,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         config,
         BLOCK_M=BLOCK_M,
         TILE_SIZE=config["TILE_SIZE"],
-        num_warps=config["num_warps"],
+        num_warps=config.get("num_warps", 1),
     )
 
 

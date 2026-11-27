@@ -1042,6 +1042,149 @@ def kernel_unified_attention_3d(
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
+kernel_unified_attention_decode_2h_repr = make_kernel_repr(
+    "kernel_unified_attention_decode_2h",
+    [
+        "NUM_SEGMENTS_PER_SEQ",
+        "num_warps",
+        "waves_per_eu",
+        "num_stages",
+        "IS_Q_FP8",
+        "USE_SINKS",
+    ],
+)
+
+
+@triton.jit(repr=kernel_unified_attention_decode_2h_repr)
+def kernel_unified_attention_decode_2h(
+    segm_output_ptr,  # [num_seqs, num_query_heads, NUM_SEGMENTS_PER_SEQ, 64] fp32
+    segm_max_ptr,  # [num_seqs, num_query_heads, NUM_SEGMENTS_PER_SEQ] fp32
+    segm_expsum_ptr,  # [num_seqs, num_query_heads, NUM_SEGMENTS_PER_SEQ] fp32
+    query_ptr,  # [num_seqs, num_query_heads, 64], one decode token per seq
+    key_cache_ptr,  # [num_blks, 64, num_kv_heads, 64] fp8, contiguous
+    value_cache_ptr,  # [num_blks, 64, num_kv_heads, 64] fp8, contiguous
+    sink_ptr,  # [num_query_heads] or None
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
+    scale,  # float32
+    q_descale_ptr,
+    k_descale_ptr,
+    v_descale_ptr,
+    num_query_heads: tl.constexpr,
+    block_table_stride: tl.int64,
+    query_stride_0: tl.int64,
+    query_stride_1: tl.int64,
+    stride_k_cache_0: tl.int64,
+    stride_k_cache_1: tl.int64,
+    stride_v_cache_0: tl.int64,
+    stride_v_cache_1: tl.int64,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    USE_SINKS: tl.constexpr,
+    IS_Q_FP8: tl.constexpr,
+):
+    """GQA-8, head size 64, page 64, all-decode split-KV producer for two adjacent KV heads.
+
+    BLOCK_M is 16 = 8 query heads x 2 KV heads, so no row is padding. QK runs against both
+    heads' K at once through a block-diagonal Q (zeros outside each row's own head half);
+    PV accumulates [16, 128] and each row keeps its own head's half. Writes the same split
+    partials as kernel_unified_attention_3d, so the same reduce follows.
+    """
+    HD: tl.constexpr = 64
+    TILE: tl.constexpr = 64
+    pair_idx = tl.program_id(0)
+    seq_idx = tl.program_id(1)
+    segm_idx = tl.program_id(2)
+    RCP_LN2 = 1.4426950408889634
+    qk_scale = scale * RCP_LN2
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE)
+    segm_tile_start = segm_idx * tiles_per_segment
+    if segm_tile_start * TILE >= seq_len:
+        return
+    num_tiles = cdiv_fn(seq_len, TILE)
+    tile_end = tl.minimum(segm_tile_start + tiles_per_segment, num_tiles)
+
+    offs_m = tl.arange(0, 16)  # row m: query head 16 * pair_idx + m, KV head 2 * pair_idx + m // 8
+    offs_d2 = tl.arange(0, 2 * HD)  # both heads' dims, head-major: column c = (c // 64, c % 64)
+    offs_t = tl.arange(0, TILE)
+    q_head = pair_idx * 16 + offs_m
+
+    # block-diagonal Q [16, 128]: row m holds its query in its own KV head's 64 columns
+    own = (offs_d2[None, :] // HD) == (offs_m[:, None] // 8)
+    q_off = (
+        seq_idx * query_stride_0
+        + q_head[:, None] * query_stride_1
+        + (offs_d2[None, :] % HD)
+    )
+    Q = tl.load(query_ptr + q_off, mask=own, other=0.0)
+
+    if USE_SINKS:
+        if segm_idx == 0:
+            M = tl.load(sink_ptr + q_head).to(tl.float32) * RCP_LN2
+        else:
+            M = tl.full([16], float("-inf"), dtype=tl.float32)
+    else:
+        M = tl.full([16], float("-inf"), dtype=tl.float32)
+    L = tl.full([16], 1.0, dtype=tl.float32)
+    acc = tl.zeros([16, 2 * HD], dtype=tl.float32)
+
+    if q_descale_ptr is not None:
+        qk_scale = qk_scale * tl.load(q_descale_ptr)
+    if k_descale_ptr is not None:
+        qk_scale = qk_scale * tl.load(k_descale_ptr)
+    out_factor: tl.float32 = 1.0
+    if v_descale_ptr is not None:
+        out_factor = tl.load(v_descale_ptr)
+
+    # in-page offsets of the two heads (adjacent in NHD: 128 contiguous bytes a token)
+    kv_head0 = pair_idx * 2
+    k_off_page = kv_head0 * HD + offs_d2[:, None] + offs_t[None, :] * stride_k_cache_1  # [128, 64]
+    v_off_page = kv_head0 * HD + offs_t[:, None] * stride_v_cache_1 + offs_d2[None, :]  # [64, 128]
+    block_table_offset = seq_idx * block_table_stride
+
+    for j in range(segm_tile_start, tile_end):
+        page = tl.load(block_tables_ptr + block_table_offset + j).to(tl.int64)
+        K = tl.load(key_cache_ptr + page * stride_k_cache_0 + k_off_page, cache_modifier=".cg").to(Q.dtype)
+        V = tl.load(value_cache_ptr + page * stride_v_cache_0 + v_off_page, cache_modifier=".cg").to(Q.dtype)
+        S = qk_scale * tl.dot(Q, K)  # [16, 64]
+        if (j + 1) * TILE > seq_len:
+            S = tl.where((j * TILE + offs_t)[None, :] < seq_len, S, float("-inf"))
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.math.exp2(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.math.exp2(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)  # [16, 128]
+
+    acc = acc * out_factor
+    # keep each row's own head half: [16, 2, 64] -> [16, 64]
+    acc3 = tl.reshape(acc, (16, 2, HD))
+    sel = tl.arange(0, 2)[None, :, None] == (offs_m // 8)[:, None, None]
+    out = tl.sum(tl.where(sel, acc3, 0.0), axis=1)
+    if NUM_SEGMENTS_PER_SEQ == 1:
+        out = out / L[:, None]
+    offs_d = tl.arange(0, HD)
+    segm_output_offset = (
+        seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HD)
+        + q_head[:, None] * (NUM_SEGMENTS_PER_SEQ * HD)
+        + segm_idx * HD
+        + offs_d[None, :]
+    )
+    tl.store(segm_output_ptr + segm_output_offset, out)
+    if NUM_SEGMENTS_PER_SEQ > 1:
+        segm_offset = (
+            seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + q_head * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        tl.store(segm_max_ptr + segm_offset, M)
+        tl.store(segm_expsum_ptr + segm_offset, L)
+
+
 _reduce_segments_repr = make_kernel_repr(
     "reduce_segments",
     [
