@@ -458,6 +458,102 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
 
 
 @pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
+@pytest.mark.parametrize(
+    "batch_size, max_kv_len", [(8, 65537), (8, 1025), (44, 4097), (168, 513), (168, 33000)]
+)
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("kv_head_first", [False, True])
+@torch.inference_mode()
+def test_unified_attn_decode_hoist_kv_addr(
+    num_heads, batch_size, max_kv_len, use_sinks, kv_head_first, monkeypatch
+):
+    """AITER_UA_DECODE_HOIST: same stored output bits as the default Triton 3D decode."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Triton decode")
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    # unequal lengths: page multiples, page + 1, one token, and two empty trailing slots
+    seq_lens = [
+        (1, max(1, max_kv_len - (i % 7) * 63 - (i % 3))) for i in range(batch_size)
+    ]
+    seq_lens += [(0, 0), (0, 0)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * triton.cdiv(max_kv_len, 64),
+        block_size=64,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    assert block_tables.shape == (len(seq_lens), triton.cdiv(max_kv_len, 64))
+    assert ((block_tables >= 0) & (block_tables < key_cache.shape[0])).all()
+    kwargs = dict(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks if use_sinks else None,
+        decode_kv_head_first=kv_head_first,
+    )
+    live = int(cu_query_lens[-1].item())
+    monkeypatch.setattr(ua, "_UA_DECODE_HOIST", False)
+    unified_attention(out=output, **kwargs)
+    hoisted = torch.full_like(output, float("nan"))
+    monkeypatch.setattr(ua, "_UA_DECODE_HOIST", True)
+    unified_attention(out=hoisted, **kwargs)
+    torch.cuda.synchronize()
+    assert torch.isfinite(hoisted[:live]).all()
+    torch.testing.assert_close(hoisted[:live], output[:live], rtol=0, atol=0)
+
+    # and inside a graph, replayed with new query values
+    graph_out = torch.empty_like(output)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        unified_attention(out=graph_out, **kwargs)
+    query.neg_()
+    g.replay()
+    monkeypatch.setattr(ua, "_UA_DECODE_HOIST", False)
+    unified_attention(out=output, **kwargs)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out[:live], output[:live], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
 @pytest.mark.parametrize("batch_size, max_kv_len", [(8, 65537), (44, 4097), (168, 513)])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @torch.inference_mode()

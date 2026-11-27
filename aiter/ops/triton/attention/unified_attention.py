@@ -1103,6 +1103,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     )
 
 
+_UA_DECODE_HOIST = os.environ.get("AITER_UA_DECODE_HOIST", "0") == "1"
+
+
 def _unified_attention_3d_triton(
     params: _UAParams,
     segm_output,
@@ -1125,6 +1128,19 @@ def _unified_attention_3d_triton(
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
     kv_head_first = params.all_decode and params.decode_kv_head_first
+    # AITER_UA_DECODE_HOIST=1 (off by default): plain-NHD decode with one page per
+    # tile takes the loop-invariant K/V in-page offsets out of the KV loop and skips
+    # the causal mask on tiles wholly below seq_len (same loads and math for the
+    # stored rows; see kernel_unified_attention_3d HOIST_KV_ADDR).
+    hoist_kv_addr = (
+        _UA_DECODE_HOIST
+        and params.all_decode
+        and not params.shuffled_kv_cache
+        and params.sliding_window <= 0
+        and TILE_SIZE == params.block_size
+        and triton.next_power_of_2(params.head_size) == params.head_size
+        and triton.next_power_of_2(params.head_size_v) == params.head_size_v
+    )
     grid = (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
     if kv_head_first:
         grid = (params.num_kv_heads, total_num_q_blocks, NUM_SEGMENTS)
@@ -1184,6 +1200,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         KV_HEAD_FIRST=kv_head_first,
+        HOIST_KV_ADDR=hoist_kv_addr,
         TILE_SIZE=TILE_SIZE,
         **config,
         enable_fp_fusion=True,

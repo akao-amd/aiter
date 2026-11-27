@@ -584,6 +584,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "IS_Q_FP8",
         "IS_KV_FP8",
         "KV_HEAD_FIRST",
+        "HOIST_KV_ADDR",
     ],
 )
 
@@ -647,6 +648,7 @@ def kernel_unified_attention_3d(
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
     KV_HEAD_FIRST: tl.constexpr = False,
+    HOIST_KV_ADDR: tl.constexpr = False,
 ):
     if KV_HEAD_FIRST:
         q_block_global_idx = tl.program_id(1)
@@ -814,6 +816,25 @@ def kernel_unified_attention_3d(
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
 
+    # HOIST_KV_ADDR (plain NHD, one page per tile): the in-page part of the K/V
+    # offsets is loop-invariant; the loop adds one scalar page base per tile instead
+    # of rebuilding [64 x 64] int64 offsets from a 64-wide gather of one table entry.
+    if HOIST_KV_ADDR:
+        tl.static_assert(not SHUFFLED_KV_CACHE)
+        tl.static_assert(TILE_SIZE == BLOCK_SIZE)
+        tl.static_assert(HEAD_SIZE_PADDED == HEAD_SIZE)
+        tl.static_assert(V_HEAD_SIZE_PADDED == V_HEAD_SIZE)
+        k_off_page = (
+            kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + offs_t[None, :] * stride_k_cache_1
+        )
+        v_off_page = (
+            kv_head_idx * stride_v_cache_2
+            + offs_vd[None, :] * stride_v_cache_3
+            + offs_t[:, None] * stride_v_cache_1
+        )
+
     # iterate through tiles within current segment
     for j in range(
         segm_tile_start,
@@ -828,7 +849,15 @@ def kernel_unified_attention_3d(
         k_mask = None
         v_mask = None
         other = None
-        if SHUFFLED_KV_CACHE:
+        k_base = key_cache_ptr
+        v_base = value_cache_ptr
+        if HOIST_KV_ADDR:
+            page = tl.load(block_tables_ptr + block_table_offset + j).to(tl.int64)
+            k_base = key_cache_ptr + page * stride_k_cache_0
+            v_base = value_cache_ptr + page * stride_v_cache_0
+            k_offset = k_off_page
+            v_offset = v_off_page
+        elif SHUFFLED_KV_CACHE:
             physical_block_idx_shfl = tl.load(
                 block_tables_ptr + block_table_offset + j
             ).to(tl.int64)
@@ -867,7 +896,7 @@ def kernel_unified_attention_3d(
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
-            key_cache_ptr + k_offset,
+            k_base + k_offset,
             mask=k_mask,
             other=other,
             cache_modifier=KV_cache_modifier,
@@ -888,7 +917,7 @@ def kernel_unified_attention_3d(
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
-            value_cache_ptr + v_offset,
+            v_base + v_offset,
             mask=v_mask,
             other=other,
             cache_modifier=KV_cache_modifier,
@@ -917,9 +946,22 @@ def kernel_unified_attention_3d(
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        if HOIST_KV_ADDR and ALL_DECODE:
+            # decode: a tile wholly below seq_len needs no causal mask; rows of
+            # padded query slots (masked out below) are never stored, and each
+            # row's softmax only reads its own scores, so valid rows are unchanged
+            if (j + 1) * TILE_SIZE > max_seq_prefix_len:
+                S = tl.where(
+                    query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                    S,
+                    float("-inf"),
+                )
+        else:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
 
         if SLIDING_WINDOW > 0:
             S = tl.where(
