@@ -446,7 +446,6 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
-        backend="triton",
     )
     unified_attention(out=output, **kwargs)
     reordered = torch.empty_like(output)
