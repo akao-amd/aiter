@@ -220,6 +220,7 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
     # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
     force_fp8_pv_on_fp4_kv_cache: bool = False
+    decode_kv_head_first: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -468,6 +469,8 @@ def unified_attention(
     # output_rows[r] (every token still attends and its KV is read as usual).
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
+    # Triton 3D decode only: put adjacent KV heads on the first grid axis.
+    decode_kv_head_first: bool = False,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -646,6 +649,7 @@ def unified_attention(
         output_scale=output_scale,
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
+        decode_kv_head_first=decode_kv_head_first,
     )
 
     # if batch contains a prefill
@@ -1074,9 +1078,12 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_3d[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    kv_head_first = params.all_decode and params.decode_kv_head_first
+    grid = (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+    if kv_head_first:
+        grid = (params.num_kv_heads, total_num_q_blocks, NUM_SEGMENTS)
+
+    kernel_unified_attention_3d[grid](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -1130,6 +1137,7 @@ def _unified_attention_3d_triton(
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+        KV_HEAD_FIRST=kv_head_first,
         TILE_SIZE=TILE_SIZE,
         **config,
         enable_fp_fusion=True,

@@ -583,6 +583,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "KV_HEAD_FIRST",
     ],
 )
 
@@ -645,9 +646,14 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    KV_HEAD_FIRST: tl.constexpr = False,
 ):
-    q_block_global_idx = tl.program_id(0)
-    kv_head_idx = tl.program_id(1)
+    if KV_HEAD_FIRST:
+        q_block_global_idx = tl.program_id(1)
+        kv_head_idx = tl.program_id(0)
+    else:
+        q_block_global_idx = tl.program_id(0)
+        kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
 
     # needed to use exp2 (exp2 -> exp conversion)

@@ -386,6 +386,75 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
+@pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
+@pytest.mark.parametrize("batch_size, max_kv_len", [(8, 1025), (44, 4097), (168, 513)])
+@torch.inference_mode()
+def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_len):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Triton decode traversal")
+
+    # Empty trailing sequences cover graph padding; unequal lengths cover split tails.
+    seq_lens = [(1, max_kv_len - (i % 5) * 64) for i in range(batch_size)]
+    seq_lens += [(0, 0), (0, 0)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=128,
+        block_size=64,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    kwargs = dict(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        backend="triton",
+    )
+    unified_attention(out=output, **kwargs)
+    reordered = torch.empty_like(output)
+    unified_attention(out=reordered, decode_kv_head_first=True, **kwargs)
+    torch.testing.assert_close(reordered, output, rtol=0, atol=0)
+    assert torch.isfinite(reordered).all()
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
