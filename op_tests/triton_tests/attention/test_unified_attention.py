@@ -454,6 +454,120 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
     assert torch.isfinite(reordered).all()
 
 
+@pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
+@pytest.mark.parametrize("batch_size, max_kv_len", [(8, 65537), (44, 4097), (168, 513)])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@torch.inference_mode()
+def test_unified_attn_decode_nhd_tdm(
+    num_heads, batch_size, max_kv_len, use_sinks, monkeypatch
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 NHD TDM decode")
+
+    seq_lens = [(1, max_kv_len - (i % 5) * 64) for i in range(batch_size)]
+    seq_lens += [(0, 0), (0, 0)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=128,
+        block_size=64,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    sinks = sinks if use_sinks else None
+    kwargs = dict(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
+    unified_attention(out=output, **kwargs)
+
+    module = sys.modules[unified_attention.__module__]
+    original = module._unified_attention_3d_gfx1250
+    calls = []
+
+    def traced(params, *args, **options):
+        assert params.decode_nhd_tdm and not params.shuffled_kv_cache
+        assert args[-1] == 64 and options.get("segm_tiles") is None
+        calls.append(args[-2])
+        return original(params, *args, **options)
+
+    monkeypatch.setattr(module, "_unified_attention_3d_gfx1250", traced)
+    candidate = torch.empty_like(output)
+    unified_attention(out=candidate, decode_nhd_tdm=True, **kwargs)
+    assert len(calls) == 1, "NHD TDM producer did not run"
+    assert torch.isfinite(candidate).all() and torch.isfinite(output).all()
+    torch.testing.assert_close(candidate, output, atol=1e-3, rtol=1e-2)
+
+    def current_reference():
+        return ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=[q for q, _ in seq_lens],
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            scale=scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            out_dtype=torch.bfloat16,
+        )
+
+    reference = current_reference()
+    assert torch.isfinite(reference).all()
+    torch.testing.assert_close(candidate, reference, atol=1e-3, rtol=1e-2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        unified_attention(out=candidate, decode_nhd_tdm=True, **kwargs)
+    assert len(calls) == 2
+    for delta in (-1, 1):
+        query.neg_()
+        kv_lens[:batch_size].add_(delta)
+        graph.replay()
+        reference = current_reference()
+        assert torch.isfinite(candidate).all() and torch.isfinite(reference).all()
+        torch.testing.assert_close(candidate, reference, atol=1e-3, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [

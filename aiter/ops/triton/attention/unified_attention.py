@@ -221,6 +221,7 @@ class _UAParams(NamedTuple):
     # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
     force_fp8_pv_on_fp4_kv_cache: bool = False
     decode_kv_head_first: bool = False
+    decode_nhd_tdm: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -471,6 +472,8 @@ def unified_attention(
     output_rows: torch.Tensor | None = None,
     # Triton 3D decode only: put adjacent KV heads on the first grid axis.
     decode_kv_head_first: bool = False,
+    # gfx1250 BF16-Q/FP8-KV decode only: use the existing plain-NHD TDM loader.
+    decode_nhd_tdm: bool = False,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -650,7 +653,19 @@ def unified_attention(
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
         decode_kv_head_first=decode_kv_head_first,
+        decode_nhd_tdm=decode_nhd_tdm,
     )
+    if decode_nhd_tdm and (
+        backend != "gluon"
+        or _unified_attention_kernel_3d_gfx1250 is None
+        or not _decode_nhd_tdm_supported(params)
+        or decode_kv_head_first
+        or epilogue
+    ):
+        raise ValueError(
+            "decode_nhd_tdm requires gfx1250 full decode, contiguous NHD FP8 KV, "
+            "BF16 Q/output, D64/page64/GQA8 with 4 or 8 KV heads, and no other experiment"
+        )
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -683,7 +698,9 @@ def unified_attention(
         if use_gluon_3d and DEVICE_ARCH == "gfx950":
             split_params = _gfx950_split_params(params)
         config = get_unified_attention_config(
-            "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
+            "kv_split",
+            split_params,
+            backend="gluon" if use_gluon_3d and not decode_nhd_tdm else "triton",
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
         if (
@@ -703,8 +720,10 @@ def unified_attention(
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         segm_tiles = None
-        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+        if use_gluon_3d and DEVICE_ARCH == "gfx1250" and not decode_nhd_tdm:
             NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
+        if decode_nhd_tdm:
+            assert CONFIG_TILE_SIZE == block_size, "NHD TDM loads one page per tile"
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -913,15 +932,42 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     return use_gluon and use_gluon_arch
 
 
+def _decode_nhd_tdm_supported(params: _UAParams):
+    """Coverage of the opt-in plain-NHD TDM decode experiment."""
+    return (
+        DEVICE_ARCH == "gfx1250"
+        and params.all_decode
+        and not params.shuffled_kv_cache
+        and params.sliding_window <= 0
+        and not params.softcap
+        and not params.use_qq_bias
+        and not params.use_alibi_slopes
+        and params.block_size == params.head_size == params.head_size_v == 64
+        and params.num_queries_per_kv == 8
+        and params.num_kv_heads in (4, 8)
+        and params.num_query_heads == params.num_kv_heads * 8
+        and params.k.shape[-1] == 64
+        and params.k.shape == params.v.shape
+        and params.out.shape == params.q.shape
+        and params.q_dtype == params.out.dtype == torch.bfloat16
+        and params.kv_cache_dtype == params.v_cache_dtype == e4m3_dtype
+        and params.q_descale is None
+        and params.output_scale is None
+        and params.q.stride(-1) == 1
+        and params.k.is_contiguous()
+        and params.v.is_contiguous()
+        and params.out.is_contiguous()
+    )
+
+
 def is_3d_gluon_available(params: _UAParams, backend: str):
     use_gluon = backend == "gluon" and _is_gluon_available()
 
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-        use_gluon_arch = (
-            _unified_attention_kernel_3d_gfx1250 is not None
-            and params.shuffled_kv_cache
+        use_gluon_arch = _unified_attention_kernel_3d_gfx1250 is not None and (
+            params.shuffled_kv_cache or params.decode_nhd_tdm
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
@@ -1499,7 +1545,8 @@ def _unified_attention_3d_gfx1250(
         FP8_PV=params.force_fp8_pv_on_fp4_kv_cache
         and params.v_cache_dtype == torch.uint8,
         V_CACHE_DTYPE=V_CACHE_DTYPE,
-        USE_STORE_TDM=True,
+        # The NHD experiment keeps register stores of the FP32 partials.
+        USE_STORE_TDM=not params.decode_nhd_tdm,
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(
             int(os.environ.get("AITER_UA_FP4_HEAD_SPLIT", "1"))

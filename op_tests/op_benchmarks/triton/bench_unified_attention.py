@@ -376,7 +376,12 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size,
+    shuffled_kv_cache,
+    equal_seqlen_q,
+    fp8_pv,
+    backend,
+    decode_nhd_tdm=False,
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
@@ -402,6 +407,7 @@ def _make_unified_attention_fn(
         softmax_scale,
         **_,
     ):
+        decode_options = {"decode_nhd_tdm": True} if decode_nhd_tdm else {}
         unified_attention(
             q=q,
             k=k,
@@ -425,6 +431,7 @@ def _make_unified_attention_fn(
             shuffled_kv_cache=shuffled_kv_cache,
             equal_seqlen_q=equal_seqlen_q,
             backend=backend,
+            **decode_options,
         )
 
     return kernel_fn
@@ -432,6 +439,8 @@ def _make_unified_attention_fn(
 
 def _mode_label(args):
     parts = []
+    if args.decode_nhd_tdm:
+        parts.append("nhd_tdm")
     if args.nvfp4:
         parts.append("a4w4_nvfp4")
     elif args.k4v8:
@@ -597,6 +606,7 @@ def run_benchmark(custom, args):
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
+            decode_nhd_tdm=args.decode_nhd_tdm,
         )
 
         if args.equal_seqlen_q:
@@ -759,6 +769,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-d", type=int, default=0, help="Q/K head size")
     parser.add_argument("-dv", type=int, default=0, help="V head size (defaults to -d)")
     parser.add_argument("-block_size", type=int, default=0, help="KV cache block size")
+    parser.add_argument(
+        "--decode-nhd-tdm",
+        action="store_true",
+        help="Opt in to gfx1250 plain-NHD TDM decode (BF16 Q, FP8 KV, D64/page64/GQA8)",
+    )
     parser.add_argument(
         "-test",
         action="store_true",
