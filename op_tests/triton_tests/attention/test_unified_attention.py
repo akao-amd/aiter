@@ -465,8 +465,23 @@ def test_unified_attn_decode_two_heads_gate(monkeypatch):
     packed NVFP4 Q), GQA 8 with an even KV head count, split KV, and the switch on."""
     import aiter.ops.triton.attention.unified_attention as ua
 
+    class Meta:
+        """Shape/dtype/stride metadata only: the gate reads no tensor data."""
+
+        def __init__(self, shape, dtype):
+            self.shape = torch.Size(shape)
+            self.dtype = dtype
+            st, acc = [], 1
+            for n in reversed(shape):
+                st.append(acc)
+                acc *= n
+            self._strides = tuple(reversed(st))
+
+        def stride(self, dim):
+            return self._strides[dim]
+
     def params(q, hq=32, hkv=4):
-        kv = torch.empty(16, 64, hkv, 64, dtype=e4m3_dtype)
+        kv = Meta((16, 64, hkv, 64), e4m3_dtype)
         return SimpleNamespace(
             all_decode=True, shuffled_kv_cache=False, sliding_window=-1, softcap=0,
             use_alibi_slopes=False, use_qq_bias=False, output_scale=None,
@@ -478,13 +493,13 @@ def test_unified_attn_decode_two_heads_gate(monkeypatch):
 
     monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx1250")
     monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", True)
-    bf16_q = torch.empty(1, 32, 64, dtype=torch.bfloat16)
+    bf16_q = Meta((1, 32, 64), torch.bfloat16)
     assert ua._decode_two_heads_applies(params(bf16_q), 64, 4)
-    assert ua._decode_two_heads_applies(params(bf16_q.to(e4m3_dtype)), 64, 4)
+    assert ua._decode_two_heads_applies(params(Meta((1, 32, 64), e4m3_dtype)), 64, 4)
     # packed NVFP4 Q: logical head 64 but 32 stored bytes a head
-    assert not ua._decode_two_heads_applies(params(torch.empty(1, 32, 32, dtype=torch.uint8)), 64, 4)
+    assert not ua._decode_two_heads_applies(params(Meta((1, 32, 32), torch.uint8)), 64, 4)
     assert not ua._decode_two_heads_applies(params(bf16_q), 64, 1)  # single segment
-    assert not ua._decode_two_heads_applies(params(torch.empty(1, 24, 64, dtype=torch.bfloat16), 24, 3), 64, 4)
+    assert not ua._decode_two_heads_applies(params(Meta((1, 24, 64), torch.bfloat16), 24, 3), 64, 4)
     monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx950")
     assert not ua._decode_two_heads_applies(params(bf16_q), 64, 4)
     monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx1250")
