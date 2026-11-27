@@ -388,8 +388,11 @@ def ref_paged_attn(
 
 @pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
 @pytest.mark.parametrize("batch_size, max_kv_len", [(8, 1025), (44, 4097), (168, 513)])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, e4m3_dtype])
 @torch.inference_mode()
-def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_len):
+def test_triton_unified_attn_decode_kv_head_first(
+    num_heads, batch_size, max_kv_len, q_dtype
+):
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("gfx1250 Triton decode traversal")
 
@@ -423,7 +426,7 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
         block_size=64,
         head_size=64,
         num_heads=num_heads,
-        q_dtype=torch.bfloat16,
+        q_dtype=q_dtype,
         kv_dtype=e4m3_dtype,
         out_dtype=torch.bfloat16,
         device="cuda",
