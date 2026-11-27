@@ -476,6 +476,8 @@ def test_unified_attn_decode_hoist_kv_addr(
     seq_lens = [
         (1, max(1, max_kv_len - (i % 7) * 63 - (i % 3))) for i in range(batch_size)
     ]
+    # row 0 keeps max_kv_len; rows 1-3: exactly one page, one page + 1, one token
+    seq_lens[1:4] = [(1, 64), (1, 65), (1, 1)]
     seq_lens += [(0, 0), (0, 0)]
     (
         query,
@@ -540,17 +542,27 @@ def test_unified_attn_decode_hoist_kv_addr(
     assert torch.isfinite(hoisted[:live]).all()
     torch.testing.assert_close(hoisted[:live], output[:live], rtol=0, atol=0)
 
-    # and inside a graph, replayed with new query values
+    assert int(kv_lens[1]) == 64 and int(kv_lens[2]) == 65 and int(kv_lens[3]) == 1
+
+    # inside a graph, replayed with new query values and with live lengths that move a
+    # partial last tile to a full one and back (captured grid/split metadata fixed)
     graph_out = torch.empty_like(output)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         unified_attention(out=graph_out, **kwargs)
-    query.neg_()
-    g.replay()
-    monkeypatch.setattr(ua, "_UA_DECODE_HOIST", False)
-    unified_attention(out=output, **kwargs)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(graph_out[:live], output[:live], rtol=0, atol=0)
+    reference = torch.empty_like(output)
+    for step, (len1, len2) in enumerate(((64, 65), (65, 64), (64, 65))):
+        kv_lens[1] = len1
+        kv_lens[2] = len2
+        query.neg_()
+        graph_out.fill_(float("nan"))
+        g.replay()
+        monkeypatch.setattr(ua, "_UA_DECODE_HOIST", False)
+        unified_attention(out=reference, **kwargs)
+        monkeypatch.setattr(ua, "_UA_DECODE_HOIST", True)
+        torch.cuda.synchronize()
+        assert torch.isfinite(graph_out[:live]).all(), step
+        torch.testing.assert_close(graph_out[:live], reference[:live], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
