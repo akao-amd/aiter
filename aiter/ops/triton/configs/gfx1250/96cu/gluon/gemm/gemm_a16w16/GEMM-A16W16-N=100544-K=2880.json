@@ -52,7 +52,8 @@
         "NUM_BUFFERS": 3,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_128": {
         "BLOCK_M": 128,
@@ -61,7 +62,8 @@
         "NUM_BUFFERS": 3,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_256": {
         "BLOCK_M": 128,
@@ -70,6 +72,7 @@
         "NUM_BUFFERS": 3,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     }
 }
