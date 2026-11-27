@@ -463,9 +463,10 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
 )
 @pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("kv_head_first", [False, True])
+@pytest.mark.parametrize("q_fp8", [False, True])
 @torch.inference_mode()
 def test_unified_attn_decode_hoist_kv_addr(
-    num_heads, batch_size, max_kv_len, use_sinks, kv_head_first, monkeypatch
+    num_heads, batch_size, max_kv_len, use_sinks, kv_head_first, q_fp8, monkeypatch
 ):
     """AITER_UA_DECODE_HOIST: same stored output bits as the default Triton 3D decode."""
     if DEVICE_ARCH != "gfx1250":
@@ -506,7 +507,8 @@ def test_unified_attn_decode_hoist_kv_addr(
         block_size=64,
         head_size=64,
         num_heads=num_heads,
-        q_dtype=torch.bfloat16,
+        # FP8 Q (SGLANG_6003_DECODE_Q=dynamic): fp8 Q with a scalar q_descale, FP8 QK and PV
+        q_dtype=e4m3_dtype if q_fp8 else torch.bfloat16,
         kv_dtype=e4m3_dtype,
         out_dtype=torch.bfloat16,
         device="cuda",
@@ -554,7 +556,10 @@ def test_unified_attn_decode_hoist_kv_addr(
     for step, (len1, len2) in enumerate(((64, 65), (65, 64), (64, 65))):
         kv_lens[1] = len1
         kv_lens[2] = len2
-        query.neg_()
+        if q_fp8:  # flip the sign bit: fp8 tensors have no neg_
+            query.view(torch.uint8).bitwise_xor_(0x80)
+        else:
+            query.neg_()
         graph_out.fill_(float("nan"))
         g.replay()
         monkeypatch.setattr(ua, "_UA_DECODE_HOIST", False)
