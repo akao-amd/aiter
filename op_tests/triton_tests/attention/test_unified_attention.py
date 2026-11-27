@@ -419,7 +419,7 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
         _,
     ) = generate_data(
         seq_lens=seq_lens,
-        num_blocks=128,
+        num_blocks=len(seq_lens) * triton.cdiv(max_kv_len, 64),
         block_size=64,
         head_size=64,
         num_heads=num_heads,
@@ -428,6 +428,9 @@ def test_triton_unified_attn_decode_kv_head_first(num_heads, batch_size, max_kv_
         out_dtype=torch.bfloat16,
         device="cuda",
     )
+
+    assert block_tables.shape == (len(seq_lens), triton.cdiv(max_kv_len, 64))
+    assert ((block_tables >= 0) & (block_tables < key_cache.shape[0])).all()
 
     kwargs = dict(
         q=query,
@@ -489,7 +492,7 @@ def test_unified_attn_decode_nhd_tdm(
         _,
     ) = generate_data(
         seq_lens=seq_lens,
-        num_blocks=128,
+        num_blocks=len(seq_lens) * triton.cdiv(max_kv_len, 64),
         block_size=64,
         head_size=64,
         num_heads=num_heads,
@@ -498,6 +501,8 @@ def test_unified_attn_decode_nhd_tdm(
         out_dtype=torch.bfloat16,
         device="cuda",
     )
+    assert block_tables.shape == (len(seq_lens), triton.cdiv(max_kv_len, 64))
+    assert ((block_tables >= 0) & (block_tables < key_cache.shape[0])).all()
     sinks = sinks if use_sinks else None
     kwargs = dict(
         q=query,
