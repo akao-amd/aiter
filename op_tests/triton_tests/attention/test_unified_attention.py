@@ -460,6 +460,38 @@ def test_triton_unified_attn_decode_kv_head_first(
     assert torch.isfinite(reordered).all()
 
 
+def test_unified_attn_decode_two_heads_gate(monkeypatch):
+    """The two-heads route takes only what its kernel reads: 64 stored Q values a head (not
+    packed NVFP4 Q), GQA 8 with an even KV head count, split KV, and the switch on."""
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    def params(q, hq=32, hkv=4):
+        kv = torch.empty(16, 64, hkv, 64, dtype=e4m3_dtype)
+        return SimpleNamespace(
+            all_decode=True, shuffled_kv_cache=False, sliding_window=-1, softcap=0,
+            use_alibi_slopes=False, use_qq_bias=False, output_scale=None,
+            num_queries_per_kv=hq // hkv, num_kv_heads=hkv, num_query_heads=hq,
+            head_size=64, head_size_v=64, block_size=64,
+            kv_cache_dtype=e4m3_dtype, v_cache_dtype=e4m3_dtype,
+            q=q, q_dtype=q.dtype, k=kv, v=kv,
+        )
+
+    monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", True)
+    bf16_q = torch.empty(1, 32, 64, dtype=torch.bfloat16)
+    assert ua._decode_two_heads_applies(params(bf16_q), 64, 4)
+    assert ua._decode_two_heads_applies(params(bf16_q.to(e4m3_dtype)), 64, 4)
+    # packed NVFP4 Q: logical head 64 but 32 stored bytes a head
+    assert not ua._decode_two_heads_applies(params(torch.empty(1, 32, 32, dtype=torch.uint8)), 64, 4)
+    assert not ua._decode_two_heads_applies(params(bf16_q), 64, 1)  # single segment
+    assert not ua._decode_two_heads_applies(params(torch.empty(1, 24, 64, dtype=torch.bfloat16), 24, 3), 64, 4)
+    monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx950")
+    assert not ua._decode_two_heads_applies(params(bf16_q), 64, 4)
+    monkeypatch.setattr(ua, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(ua, "_UA_DECODE_TWO_HEADS", False)
+    assert not ua._decode_two_heads_applies(params(bf16_q), 64, 4)
+
+
 @pytest.mark.parametrize("num_heads", [(32, 4), (64, 8)])
 @pytest.mark.parametrize(
     "batch_size, max_kv_len", [(8, 65537), (8, 1025), (44, 4097), (168, 513), (168, 33000)]

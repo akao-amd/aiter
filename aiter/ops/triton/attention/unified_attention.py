@@ -1110,11 +1110,16 @@ _UA_DECODE_HOIST = os.environ.get("AITER_UA_DECODE_HOIST", "0") == "1"
 _UA_DECODE_TWO_HEADS = os.environ.get("AITER_UA_DECODE_TWO_HEADS", "0") == "1"
 
 
-def _decode_two_heads_applies(params: _UAParams, TILE_SIZE) -> bool:
+def _decode_two_heads_applies(params: _UAParams, TILE_SIZE, NUM_SEGMENTS) -> bool:
     k, v = params.k, params.v
     return (
         _UA_DECODE_TWO_HEADS
+        and DEVICE_ARCH == "gfx1250"
         and params.all_decode
+        and NUM_SEGMENTS > 1
+        and params.q_dtype in (torch.bfloat16, e4m3_dtype)
+        and params.q.shape[-1] == 64
+        and params.num_query_heads == 8 * params.num_kv_heads
         and not params.shuffled_kv_cache
         and params.sliding_window <= 0
         and not params.softcap
@@ -1128,6 +1133,7 @@ def _decode_two_heads_applies(params: _UAParams, TILE_SIZE) -> bool:
         and params.kv_cache_dtype == params.v_cache_dtype == e4m3_dtype
         and params.q.stride(-1) == 1
         and k.shape == v.shape
+        and k.shape[-1] == v.shape[-1] == 64
         and k.stride(3) == 1
         and k.stride(2) == 64
         and v.stride(3) == 1
@@ -1165,9 +1171,9 @@ def _unified_attention_decode_2h(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         USE_SINKS=params.sinks is not None,
         IS_Q_FP8=params.q_dtype == e4m3_dtype,
-        num_warps=config.get("num_warps", 1),
-        num_stages=config.get("num_stages", 3),
-        waves_per_eu=config.get("waves_per_eu", 2),
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
     )
 
 
@@ -1192,7 +1198,7 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    if _decode_two_heads_applies(params, TILE_SIZE):
+    if _decode_two_heads_applies(params, TILE_SIZE, NUM_SEGMENTS):
         _unified_attention_decode_2h(
             params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, config
         )
@@ -1848,7 +1854,7 @@ def _unified_attention_gfx950(
         BLOCK_M=BLOCK_M,
         MFMA_DIM=config["MFMA_DIM"],
         ARCH_NAME=DEVICE_ARCH,
-        waves_per_eu=config.get("waves_per_eu", 2),
+        waves_per_eu=config["waves_per_eu"],
         USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
@@ -1877,7 +1883,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         config,
         BLOCK_M=BLOCK_M,
         TILE_SIZE=config["TILE_SIZE"],
-        num_warps=config.get("num_warps", 1),
+        num_warps=config["num_warps"],
     )
 
 

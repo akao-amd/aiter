@@ -1087,10 +1087,12 @@ def kernel_unified_attention_decode_2h(
     BLOCK_M is 16 = 8 query heads x 2 KV heads, so no row is padding. QK runs against both
     heads' K at once through a block-diagonal Q (zeros outside each row's own head half);
     PV accumulates [16, 128] and each row keeps its own head's half. Writes the same split
-    partials as kernel_unified_attention_3d, so the same reduce follows.
+    partials as kernel_unified_attention_3d (split KV only), so the same reduce follows.
     """
     HD: tl.constexpr = 64
     TILE: tl.constexpr = 64
+    # split KV only: the reduce normalises (the wrapper routes NUM_SEGMENTS > 1 here)
+    tl.static_assert(NUM_SEGMENTS_PER_SEQ > 1)
     pair_idx = tl.program_id(0)
     seq_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -1165,10 +1167,6 @@ def kernel_unified_attention_decode_2h(
     acc3 = tl.reshape(acc, (16, 2, HD))
     sel = tl.arange(0, 2)[None, :, None] == (offs_m // 8)[:, None, None]
     out = tl.sum(tl.where(sel, acc3, 0.0), axis=1)
-    if NUM_SEGMENTS_PER_SEQ == 1:
-        # same rounding as kernel_unified_attention_3d: multiply by the reciprocal
-        one_over_L = 1.0 / L[:, None]
-        out = out * one_over_L
     offs_d = tl.arange(0, HD)
     segm_output_offset = (
         seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HD)
@@ -1177,14 +1175,13 @@ def kernel_unified_attention_decode_2h(
         + offs_d[None, :]
     )
     tl.store(segm_output_ptr + segm_output_offset, out)
-    if NUM_SEGMENTS_PER_SEQ > 1:
-        segm_offset = (
-            seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-            + q_head * NUM_SEGMENTS_PER_SEQ
-            + segm_idx
-        )
-        tl.store(segm_max_ptr + segm_offset, M)
-        tl.store(segm_expsum_ptr + segm_offset, L)
+    segm_offset = (
+        seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + q_head * NUM_SEGMENTS_PER_SEQ
+        + segm_idx
+    )
+    tl.store(segm_max_ptr + segm_offset, M)
+    tl.store(segm_expsum_ptr + segm_offset, L)
 
 
 _reduce_segments_repr = make_kernel_repr(
