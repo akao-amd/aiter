@@ -1142,8 +1142,10 @@ def _decode_two_heads_applies(params: _UAParams, TILE_SIZE, NUM_SEGMENTS) -> boo
 
 
 def _unified_attention_decode_2h(
-    params: _UAParams, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, config
+    params: _UAParams, segm_output, segm_max, segm_expsum, NUM_SEGMENTS
 ):
+    # its own table: the attn_3d one-head entry's num_stages does not fit this producer
+    config = get_unified_attention_config("attn_decode_2h", params, backend="triton")
     kernel_unified_attention_decode_2h[
         (params.num_kv_heads // 2, params.num_seqs, NUM_SEGMENTS)
     ](
@@ -1200,7 +1202,7 @@ def _unified_attention_3d_triton(
 
     if _decode_two_heads_applies(params, TILE_SIZE, NUM_SEGMENTS):
         _unified_attention_decode_2h(
-            params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, config
+            params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS
         )
         return
 

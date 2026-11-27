@@ -24,6 +24,10 @@
       "DT",
       "BS",
       "Q"
+    ],
+    "attn_decode_2h": [
+      "DT",
+      "K"
     ]
   },
   "attn_2d": {
@@ -291,6 +295,23 @@
       "SEGMENTS_PER_CU": 4,
       "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 4096
+    }
+  },
+  "attn_decode_2h": {
+    "DT_fp8_fp8.K_GEQ_524288": {
+      "num_warps": 1,
+      "num_stages": 4,
+      "waves_per_eu": 2
+    },
+    "DT_bf16_fp8.K_GEQ_524288": {
+      "num_warps": 1,
+      "num_stages": 4,
+      "waves_per_eu": 2
+    },
+    "any": {
+      "num_warps": 1,
+      "num_stages": 3,
+      "waves_per_eu": 2
     }
   }
 }

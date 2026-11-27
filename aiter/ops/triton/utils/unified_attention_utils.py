@@ -58,7 +58,7 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
-_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
+_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split", "attn_decode_2h")
 
 # Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
 _ARCH_ALIAS = {
@@ -289,6 +289,7 @@ def _axis_values(
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
         + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
         "P": programs_per_cu,
+        "K": max_seqlen_k,
         **dict(extra_axes),
     }
 
@@ -434,7 +435,7 @@ def get_unified_attention_config(
     """Load the config for one op.
 
     Args:
-        op: attn_2d | attn_3d | reduce | kv_split.
+        op: attn_2d | attn_3d | reduce | kv_split | attn_decode_2h.
         params: the _UAParams for this call; every axis is read from it.
         backend: "triton" or "gluon". The two take disjoint config
             params, so a config from the wrong backend is not usable.
